@@ -17,8 +17,17 @@ jobs:
 
       - name: Install Android SDK pieces
         run: |
-          yes | sdkmanager --licenses > /dev/null || true
-          sdkmanager "platforms;android-35" "build-tools;35.0.0" "ndk;27.2.12479018"
+          SDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          SDKM="$(command -v sdkmanager || true)"
+          if [ -z "$SDKM" ]; then
+            SDKM="$(find "$SDK_ROOT" -name sdkmanager -type f 2>/dev/null | head -n 1)"
+          fi
+          echo "SDK_ROOT=$SDK_ROOT"
+          echo "SDKM=$SDKM"
+          ls "$SDK_ROOT" || true
+          (yes | "$SDKM" --sdk_root="$SDK_ROOT" --licenses > /dev/null) || true
+          "$SDKM" --sdk_root="$SDK_ROOT" "platforms;android-35" "build-tools;35.0.0" "ndk;27.2.12479018"
+          echo "ANDROID_HOME=$SDK_ROOT" >> "$GITHUB_ENV"
 
       - uses: dtolnay/rust-toolchain@stable
         with:

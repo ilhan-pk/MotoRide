@@ -6,7 +6,7 @@ use winit::window::Window;
 use crate::game::{Game, Vertex};
 use crate::hud;
 
-const MAX_WORLD_VERTS: usize = 39_999; // multiple of 3
+const MAX_WORLD_VERTS: usize = 60_000; // multiple of 3
 const MAX_COCKPIT_VERTS: usize = 600;
 const MAX_HUD_VERTS: usize = 600;
 const MAX_VERTS: usize = MAX_WORLD_VERTS + MAX_COCKPIT_VERTS + MAX_HUD_VERTS;
@@ -271,8 +271,8 @@ impl Renderer {
 
     pub fn render(&mut self, g: &Game, fps: u32) {
         let aspect = self.config.width as f32 / self.config.height as f32;
-        let proj = Mat4::perspective_rh(70f32.to_radians(), aspect, 0.05, 3000.0);
-        let view = Mat4::from_rotation_z(g.lean * 0.28) * Mat4::look_to_rh(g.pos, g.forward(), Vec3::Y);
+        let proj = Mat4::perspective_rh(70f32.to_radians(), aspect, 0.3, 2000.0);
+        let view = Mat4::from_rotation_z(g.lean * 0.28) * Mat4::look_to_rh(g.eye(), g.look_dir(), Vec3::Y);
 
         self.queue.write_buffer(
             &self.world_ub,
@@ -280,7 +280,7 @@ impl Renderer {
             bytemuck::bytes_of(&Uniforms {
                 vp: (proj * view).to_cols_array_2d(),
                 fog: FOG,
-                params: [1.0 / 260.0, 0.0, 0.0, 0.0],
+                params: [1.0 / 210.0, 0.0, 0.0, 0.0],
             }),
         );
         self.queue.write_buffer(

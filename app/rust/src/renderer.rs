@@ -293,7 +293,6 @@ impl Renderer {
                         load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.66, g: 0.72, b: 0.82, a: 1.0 }),
                         store: wgpu::StoreOp::Store,
                     },
-                    depth_slice: None,
                 })],
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                     view: &self.depth_view,

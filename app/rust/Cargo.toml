@@ -1,0 +1,31 @@
+[package]
+name = "motoride"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "motoride"
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "motoride-desktop"
+path = "src/main.rs"
+
+[dependencies]
+wgpu = "25.0"
+glam = "0.29"
+bytemuck = { version = "1", features = ["derive"] }
+pollster = "0.4"
+log = "0.4"
+
+[target.'cfg(not(target_os = "android"))'.dependencies]
+winit = "0.30"
+
+[target.'cfg(target_os = "android")'.dependencies]
+winit = { version = "0.30", default-features = false, features = ["android-native-activity", "rwh_06"] }
+android_logger = "0.14"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1

@@ -1,4 +1,5 @@
 mod game;
+mod hud;
 mod renderer;
 
 use std::{sync::Arc, time::Instant};
@@ -29,6 +30,9 @@ struct App {
     input: game::Input,
     touches: Touches,
     last: Instant,
+    fps_frames: u32,
+    fps_time: f32,
+    fps: u32,
 }
 
 impl App {
@@ -40,6 +44,9 @@ impl App {
             input: game::Input::default(),
             touches: Touches::default(),
             last: Instant::now(),
+            fps_frames: 0,
+            fps_time: 0.0,
+            fps: 0,
         }
     }
 
@@ -118,11 +125,21 @@ impl ApplicationHandler for App {
             WindowEvent::Touch(t) => self.touch(t.id, t.phase, t.location.x, t.location.y),
             WindowEvent::RedrawRequested => {
                 let now = Instant::now();
-                let dt = (now - self.last).as_secs_f32().min(0.05);
+                let raw = (now - self.last).as_secs_f32();
+                let dt = raw.min(0.05);
                 self.last = now;
+
+                self.fps_frames += 1;
+                self.fps_time += raw;
+                if self.fps_time >= 0.5 {
+                    self.fps = (self.fps_frames as f32 / self.fps_time).round() as u32;
+                    self.fps_frames = 0;
+                    self.fps_time = 0.0;
+                }
+
                 self.game.update(&self.input, dt);
                 if let Some(r) = &mut self.renderer {
-                    r.render(&self.game);
+                    r.render(&self.game, self.fps);
                 }
             }
             _ => {}

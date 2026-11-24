@@ -4,9 +4,12 @@ use glam::{Mat4, Vec3};
 use winit::window::Window;
 
 use crate::game::{Game, Vertex};
+use crate::hud;
 
 const MAX_WORLD_VERTS: usize = 39_999; // multiple of 3
 const MAX_COCKPIT_VERTS: usize = 600;
+const MAX_HUD_VERTS: usize = 600;
+const MAX_VERTS: usize = MAX_WORLD_VERTS + MAX_COCKPIT_VERTS + MAX_HUD_VERTS;
 const FOG: [f32; 4] = [0.66, 0.72, 0.82, 1.0];
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 
@@ -27,12 +30,15 @@ pub struct Renderer {
     sky_pipeline: wgpu::RenderPipeline,
     world_ub: wgpu::Buffer,
     cockpit_ub: wgpu::Buffer,
+    hud_ub: wgpu::Buffer,
     world_bg: wgpu::BindGroup,
     cockpit_bg: wgpu::BindGroup,
-    world_vb: wgpu::Buffer,
-    cockpit_vb: wgpu::Buffer,
+    hud_bg: wgpu::BindGroup,
+    /// One shared vertex buffer: [world | cockpit | hud], uploaded once per frame.
+    vb: wgpu::Buffer,
     depth_view: wgpu::TextureView,
-    scratch: Vec<Vertex>,
+    batch: Vec<Vertex>,
+    part: Vec<Vertex>,
 }
 
 fn make_depth(device: &wgpu::Device, w: u32, h: u32) -> wgpu::TextureView {
@@ -50,10 +56,17 @@ fn make_depth(device: &wgpu::Device, w: u32, h: u32) -> wgpu::TextureView {
         .create_view(&Default::default())
 }
 
-impl Renderer {
-    pub async fn new(window: Arc<Window>, w: u32, h: u32) -> Self {
-        let instance = wgpu::Instance::default();
-        let surface = instance.create_surface(window).expect("surface");
+/// Prefer Vulkan; fall back to OpenGL ES if Vulkan is unavailable on this device.
+async fn pick_backend(
+    window: Arc<Window>,
+) -> (wgpu::Instance, wgpu::Surface<'static>, wgpu::Adapter) {
+    for backends in [wgpu::Backends::VULKAN, wgpu::Backends::GL] {
+        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+            backends,
+            ..Default::default()
+        });
+        let Ok(surface) = instance.create_surface(window.clone()) else { continue };
+        // `into_iter().next()` works whether request_adapter returns Option or Result.
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
                 power_preference: wgpu::PowerPreference::HighPerformance,
@@ -61,7 +74,21 @@ impl Renderer {
                 force_fallback_adapter: false,
             })
             .await
-            .expect("no GPU adapter");
+            .into_iter()
+            .next();
+        if let Some(adapter) = adapter {
+            let info = adapter.get_info();
+            log::info!("MotoRide backend: {:?} on {}", info.backend, info.name);
+            return (instance, surface, adapter);
+        }
+        log::warn!("MotoRide: backend {:?} not available, trying next", backends);
+    }
+    panic!("no Vulkan or OpenGL ES adapter found");
+}
+
+impl Renderer {
+    pub async fn new(window: Arc<Window>, w: u32, h: u32) -> Self {
+        let (_instance, surface, adapter) = pick_backend(window).await;
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: None,
@@ -122,6 +149,7 @@ impl Renderer {
         };
         let world_ub = make_ub("world_ub");
         let cockpit_ub = make_ub("cockpit_ub");
+        let hud_ub = make_ub("hud_ub");
         let make_bg = |ub: &wgpu::Buffer| {
             device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: None,
@@ -131,18 +159,15 @@ impl Renderer {
         };
         let world_bg = make_bg(&world_ub);
         let cockpit_bg = make_bg(&cockpit_ub);
+        let hud_bg = make_bg(&hud_ub);
 
         let vsize = std::mem::size_of::<Vertex>() as u64;
-        let make_vb = |label, n: usize| {
-            device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some(label),
-                size: vsize * n as u64,
-                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            })
-        };
-        let world_vb = make_vb("world_vb", MAX_WORLD_VERTS);
-        let cockpit_vb = make_vb("cockpit_vb", MAX_COCKPIT_VERTS);
+        let vb = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("batch_vb"),
+            size: vsize * MAX_VERTS as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
 
         let attrs = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32];
         let vlayout = wgpu::VertexBufferLayout {
@@ -223,12 +248,14 @@ impl Renderer {
             sky_pipeline,
             world_ub,
             cockpit_ub,
+            hud_ub,
             world_bg,
             cockpit_bg,
-            world_vb,
-            cockpit_vb,
+            hud_bg,
+            vb,
             depth_view,
-            scratch: Vec::with_capacity(MAX_WORLD_VERTS),
+            batch: Vec::with_capacity(MAX_VERTS),
+            part: Vec::with_capacity(MAX_WORLD_VERTS),
         }
     }
 
@@ -242,7 +269,7 @@ impl Renderer {
         self.depth_view = make_depth(&self.device, w, h);
     }
 
-    pub fn render(&mut self, g: &Game) {
+    pub fn render(&mut self, g: &Game, fps: u32) {
         let aspect = self.config.width as f32 / self.config.height as f32;
         let proj = Mat4::perspective_rh(70f32.to_radians(), aspect, 0.05, 3000.0);
         let view = Mat4::from_rotation_z(g.lean * 0.28) * Mat4::look_to_rh(g.pos, g.forward(), Vec3::Y);
@@ -261,18 +288,41 @@ impl Renderer {
             0,
             bytemuck::bytes_of(&Uniforms { vp: proj.to_cols_array_2d(), fog: FOG, params: [0.0; 4] }),
         );
+        self.queue.write_buffer(
+            &self.hud_ub,
+            0,
+            bytemuck::bytes_of(&Uniforms {
+                vp: Mat4::IDENTITY.to_cols_array_2d(),
+                fog: FOG,
+                params: [0.0; 4],
+            }),
+        );
 
-        self.scratch.clear();
-        g.build_world(&mut self.scratch);
-        self.scratch.truncate(MAX_WORLD_VERTS);
-        let n_world = self.scratch.len() as u32;
-        self.queue.write_buffer(&self.world_vb, 0, bytemuck::cast_slice(&self.scratch));
+        // ---- batch all geometry into one buffer, one upload ----
+        self.batch.clear();
 
-        self.scratch.clear();
-        g.build_cockpit(&mut self.scratch);
-        self.scratch.truncate(MAX_COCKPIT_VERTS);
-        let n_cockpit = self.scratch.len() as u32;
-        self.queue.write_buffer(&self.cockpit_vb, 0, bytemuck::cast_slice(&self.scratch));
+        self.part.clear();
+        g.build_world(&mut self.part);
+        self.part.truncate(MAX_WORLD_VERTS);
+        let n_world = self.part.len() as u32;
+        self.batch.extend_from_slice(&self.part);
+
+        self.part.clear();
+        g.build_cockpit(&mut self.part);
+        self.part.truncate(MAX_COCKPIT_VERTS);
+        let n_cockpit = self.part.len() as u32;
+        self.batch.extend_from_slice(&self.part);
+
+        self.part.clear();
+        hud::build_fps(&mut self.part, fps, aspect);
+        self.part.truncate(MAX_HUD_VERTS);
+        let n_hud = self.part.len() as u32;
+        self.batch.extend_from_slice(&self.part);
+
+        self.queue.write_buffer(&self.vb, 0, bytemuck::cast_slice(&self.batch));
+
+        let cockpit_start = n_world;
+        let hud_start = n_world + n_cockpit;
 
         let frame = match self.surface.get_current_texture() {
             Ok(f) => f,
@@ -311,13 +361,16 @@ impl Renderer {
             pass.draw(0..3, 0..1);
 
             pass.set_pipeline(&self.pipeline);
+            pass.set_vertex_buffer(0, self.vb.slice(..));
+
             pass.set_bind_group(0, &self.world_bg, &[]);
-            pass.set_vertex_buffer(0, self.world_vb.slice(..));
             pass.draw(0..n_world, 0..1);
 
             pass.set_bind_group(0, &self.cockpit_bg, &[]);
-            pass.set_vertex_buffer(0, self.cockpit_vb.slice(..));
-            pass.draw(0..n_cockpit, 0..1);
+            pass.draw(cockpit_start..cockpit_start + n_cockpit, 0..1);
+
+            pass.set_bind_group(0, &self.hud_bg, &[]);
+            pass.draw(hud_start..hud_start + n_hud, 0..1);
         }
         self.queue.submit(Some(enc.finish()));
         frame.present();

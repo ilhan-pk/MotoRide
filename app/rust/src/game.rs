@@ -488,6 +488,125 @@ fn build_props(x0: f32, z0: f32, out: &mut Vec<Vertex>) {
 
 
 // ------------------------------------------------------------------
+// One-way traffic (4 low-poly car models, shared GPU buffers, one draw per car)
+// ------------------------------------------------------------------
+
+static CARS_BIN: &[u8] = include_bytes!("cars.bin");
+
+pub struct CarModel {
+    pub verts: Vec<Vertex>,
+    pub hw: f32,
+    pub hl: f32,
+    pub h: f32,
+}
+
+pub fn car_models() -> &'static Vec<CarModel> {
+    static M: std::sync::OnceLock<Vec<CarModel>> = std::sync::OnceLock::new();
+    M.get_or_init(|| {
+        let d = CARS_BIN;
+        let rf = |o: usize| f32::from_le_bytes([d[o], d[o + 1], d[o + 2], d[o + 3]]);
+        let mut o = 0usize;
+        let mut v = Vec::new();
+        while o + 20 <= d.len() {
+            let n = u32::from_le_bytes([d[o], d[o + 1], d[o + 2], d[o + 3]]) as usize;
+            let (hw, hl, h) = (rf(o + 4), rf(o + 8), rf(o + 12));
+            o += 20;
+            let mut verts = Vec::with_capacity(n);
+            for _ in 0..n {
+                verts.push(Vertex {
+                    pos: [rf(o), rf(o + 4), rf(o + 8)],
+                    color: [d[o + 12] as f32 / 255.0, d[o + 13] as f32 / 255.0, d[o + 14] as f32 / 255.0],
+                    kind: 1.0,
+                });
+                o += 16;
+            }
+            v.push(CarModel { verts, hw, hl, h });
+        }
+        v
+    })
+}
+
+/// A traffic car driving the same way as the player (towards -z) in one of two lanes.
+#[derive(Clone, Copy)]
+pub struct Car {
+    pub model: usize,
+    /// road parameter (z of the centre line)
+    pub zr: f32,
+    /// lateral lane offset (m, + = right)
+    pub lane: f32,
+    pub cruise: f32,
+    pub v: f32,
+    pub x: f32,
+    pub y: f32,
+    pub z: f32,
+    pub yaw: f32,
+    pub pitch: f32,
+    pub hw: f32,
+    pub hl: f32,
+    pub h: f32,
+}
+
+const LANES: [f32; 2] = [-2.9, 2.9];
+const N_CARS: usize = 9;
+
+fn rnd(state: &mut u32) -> f32 {
+    *state ^= *state << 13;
+    *state ^= *state >> 17;
+    *state ^= *state << 5;
+    (*state & 0xffff) as f32 / 65535.0
+}
+
+impl Car {
+    fn place(&mut self) {
+        let rp = road_dx(self.zr);
+        let s = (1.0 + rp * rp).sqrt();
+        self.x = road_x(self.zr) + self.lane / s;
+        self.z = self.zr - self.lane * rp / s;
+        self.y = road_target(self.zr) + 0.20;
+        self.yaw = rp.atan();
+    }
+}
+
+fn new_car(rng: &mut u32, zr: f32, lane_idx: usize) -> Car {
+    let ms = car_models();
+    let model = ((rnd(rng) * ms.len() as f32) as usize).min(ms.len().saturating_sub(1));
+    let m = &ms[model];
+    // relaxed traffic: 45..80 km/h, so the bike (up to ~170 km/h) overtakes everything easily
+    let cruise = 12.5 + 10.0 * rnd(rng);
+    let mut c = Car {
+        model,
+        zr,
+        lane: LANES[lane_idx % 2],
+        cruise,
+        v: cruise,
+        x: 0.0,
+        y: 0.0,
+        z: 0.0,
+        yaw: 0.0,
+        pitch: 0.0,
+        hw: m.hw,
+        hl: m.hl,
+        h: m.h,
+    };
+    c.place();
+    c
+}
+
+fn init_traffic(rng: &mut u32, from_z: f32) -> Vec<Car> {
+    if car_models().is_empty() {
+        return Vec::new();
+    }
+    let mut v: Vec<Car> = Vec::new();
+    for i in 0..N_CARS {
+        let zr = from_z - 110.0 - i as f32 * 62.0 - rnd(rng) * 30.0;
+        let lane = if rnd(rng) < 0.5 { 0 } else { 1 };
+        v.push(new_car(rng, zr, lane));
+    }
+    v
+}
+
+
+// ------------------------------------------------------------------
 // Roadside buildings (low-poly models from buildings.bin, shared GPU buffers, one draw per building)
 // ------------------------------------------------------------------
 
@@ -1052,12 +1171,16 @@ pub struct Game {
     // rider body offset relative to the bike (right, up, forward) in metres
     pub rider: [f32; 3],
     spin: f32,
+    pub cars: Vec<Car>,
+    rng: u32,
 }
 
 impl Game {
     pub fn new() -> Self {
         let x = road_x(0.0);
         let y = terrain_h(x, 0.0);
+        let mut rng = 0x1234_5678u32;
+        let cars = init_traffic(&mut rng, 0.0);
         Self {
             pos: Vec3::new(x, y, 0.0),
             vel: Vec3::ZERO,
@@ -1077,6 +1200,8 @@ impl Game {
             ax: 0.0,
             rider: [0.0; 3],
             spin: 0.0,
+            cars,
+            rng,
         }
     }
 
@@ -1172,9 +1297,11 @@ impl Game {
         self.pos.x += self.vel.x * dt;
         self.pos.z += self.vel.z * dt;
 
+        self.update_cars(dt);
         self.rail_collision();
         self.tree_collision();
         self.building_collision();
+        self.car_collision();
 
         // ---------------- vertical: follow the ground or fly (jumps) ----------------
         let g1 = terrain_h(self.pos.x, self.pos.z);
@@ -1271,6 +1398,106 @@ impl Game {
         self.susp_v -= impact * 0.32;
         self.rider[1] -= (impact * 0.012).min(0.12);
         self.vy = 0.0;
+    }
+
+    /// Move the traffic: slower on climbs, faster downhill, queueing behind slower cars in the same lane.
+    fn update_cars(&mut self, dt: f32) {
+        let bz = self.pos.z;
+        let bike_v = self.speed;
+        let snapshot: Vec<(f32, f32, f32)> = self.cars.iter().map(|c| (c.zr, c.lane, c.v)).collect();
+        for i in 0..self.cars.len() {
+            let (zr, lane) = (self.cars[i].zr, self.cars[i].lane);
+            let rp = road_dx(zr);
+            let sh = (1.0 + rp * rp).sqrt();
+            let rd = (road_target(zr + 1.5) - road_target(zr - 1.5)) / 3.0; // dh/dz
+            let climb = -rd / sh; // rise per metre while driving towards -z
+            let mut vt = self.cars[i].cruise * (1.0 - 1.7 * climb).clamp(0.6, 1.3);
+            // keep distance to the car in front (same lane)
+            for (j, &(zj, lj, vj)) in snapshot.iter().enumerate() {
+                if j == i || (lj - lane).abs() > 0.5 {
+                    continue;
+                }
+                let gap = zr - zj; // > 0 : the other car is ahead
+                if gap > 0.0 && gap < 30.0 {
+                    vt = vt.min(vj * if gap < 15.0 { 0.8 } else { 1.0 });
+                }
+            }
+            // never run the rider down from behind
+            let behind = zr - bz; // > 0 : behind the bike
+            if behind > 0.0 && behind < 25.0 && bike_v < vt {
+                vt = vt.min(bike_v.max(0.0) * 0.9);
+            }
+            let c = &mut self.cars[i];
+            let dv = (vt - c.v).clamp(-6.0 * dt, 3.0 * dt);
+            c.v += dv;
+            let s3 = (1.0 + rp * rp + rd * rd).sqrt();
+            c.zr -= c.v * dt / s3;
+            c.place();
+            // body pitch follows the slope, nose dips when braking and squats when accelerating
+            let target = climb.atan() - dv / dt.max(1e-3) * 0.006;
+            c.pitch += (target - c.pitch) * (dt * 4.0).min(1.0);
+        }
+        // recycle cars that were left far behind (the bike is much faster) or are too far ahead
+        for i in 0..self.cars.len() {
+            let d = self.cars[i].zr - bz; // + behind, - ahead
+            if d > 70.0 || d < -700.0 {
+                let mut ok = None;
+                for _ in 0..6 {
+                    let zr = bz - 340.0 - rnd(&mut self.rng) * 240.0;
+                    let lane = if rnd(&mut self.rng) < 0.5 { 0 } else { 1 };
+                    let lane_off = LANES[lane];
+                    let clear = self
+                        .cars
+                        .iter()
+                        .enumerate()
+                        .all(|(j, o)| j == i || (o.lane - lane_off).abs() > 0.5 || (o.zr - zr).abs() > 45.0);
+                    if clear {
+                        ok = Some((zr, lane));
+                        break;
+                    }
+                }
+                if let Some((zr, lane)) = ok {
+                    let mut c = new_car(&mut self.rng, zr, lane);
+                    c.pitch = 0.0;
+                    self.cars[i] = c;
+                }
+            }
+        }
+    }
+
+    /// Cars are solid: hitting one stops the bike like a guard rail.
+    fn car_collision(&mut self) {
+        for k in 0..self.cars.len() {
+            let c = self.cars[k];
+            let (dx, dz) = (self.pos.x - c.x, self.pos.z - c.z);
+            if dx * dx + dz * dz > 36.0 {
+                continue;
+            }
+            if self.pos.y > c.y + c.h + 0.2 {
+                continue; // flying over it
+            }
+            let (s, co) = c.yaw.sin_cos();
+            let lx = dx * co - dz * s;
+            let lz = dx * s + dz * co;
+            let (ex, ez) = (c.hw + 0.45, c.hl + 0.45);
+            if lx.abs() < ex && lz.abs() < ez {
+                let (px, pz) = (ex - lx.abs(), ez - lz.abs());
+                let (nlx, nlz, push) = if px < pz { (lx.signum(), 0.0, px) } else { (0.0, lz.signum(), pz) };
+                let nx = nlx * co + nlz * s;
+                let nz = -nlx * s + nlz * co;
+                self.pos.x += nx * push;
+                self.pos.z += nz * push;
+                // relative to the (moving) car
+                let cv = Vec3::new(-c.yaw.sin() * c.v, 0.0, -c.yaw.cos() * c.v);
+                let rel = self.vel - cv;
+                let vn = rel.x * nx + rel.z * nz;
+                if vn < 0.0 {
+                    self.vel.x -= nx * vn * 1.3;
+                    self.vel.z -= nz * vn * 1.3;
+                    self.vel = self.vel * 0.75;
+                }
+            }
+        }
     }
 
     /// Solid guard rails along the track (they have gaps, so you can leave it).

@@ -6,7 +6,7 @@ use glam::{Mat4, Vec3};
 use wgpu::util::{BufferInitDescriptor, DeviceExt};
 use winit::window::Window;
 
-use crate::game::{build_chunk, buildings_around, models, Game, Vertex, CHUNK};
+use crate::game::{build_chunk, buildings_around, car_models, models, Game, Vertex, CHUNK};
 use crate::hud;
 
 const MAX_BALLOON_VERTS: usize = 3_000;
@@ -62,6 +62,8 @@ pub struct Renderer {
     /// Shared building models (vertex buffer, vertex count) and per-instance uniform pool.
     bmodels: Vec<(wgpu::Buffer, u32)>,
     bpool: Vec<(wgpu::Buffer, wgpu::BindGroup)>,
+    cmodels: Vec<(wgpu::Buffer, u32)>,
+    cpool: Vec<(wgpu::Buffer, wgpu::BindGroup)>,
 }
 
 fn make_depth(device: &wgpu::Device, w: u32, h: u32) -> wgpu::TextureView {
@@ -262,6 +264,17 @@ impl Renderer {
 
         let depth_view = make_depth(&device, w, h);
 
+        let cmodels: Vec<(wgpu::Buffer, u32)> = car_models()
+            .iter()
+            .map(|m| {
+                let vb = device.create_buffer_init(&BufferInitDescriptor {
+                    label: Some("car"),
+                    contents: bytemuck::cast_slice(&m.verts),
+                    usage: wgpu::BufferUsages::VERTEX,
+                });
+                (vb, m.verts.len() as u32)
+            })
+            .collect();
         let bmodels: Vec<(wgpu::Buffer, u32)> = models()
             .iter()
             .map(|m| {
@@ -297,6 +310,8 @@ impl Renderer {
             bgl,
             bmodels,
             bpool: Vec::new(),
+            cmodels,
+            cpool: Vec::new(),
         }
     }
 
@@ -510,6 +525,52 @@ impl Renderer {
             bdraw.push((b.model, i));
         }
 
+        // ---- traffic cars: same trick, own uniform pool ----
+        let mut cdraw: Vec<(usize, usize)> = Vec::with_capacity(12);
+        for c in g.cars.iter() {
+            let dx = c.x - eye.x;
+            let dz = c.z - eye.z;
+            let dist = (dx * dx + dz * dz).sqrt();
+            if dist > 340.0 {
+                continue;
+            }
+            let along = dx * f.x + dz * f.z;
+            let perp = (dx * f.z - dz * f.x).abs();
+            if dist > 25.0 && (along < -10.0 || perp > along.max(0.0) * tan_h * 1.2 + 25.0) {
+                continue;
+            }
+            let i = cdraw.len();
+            if self.cpool.len() <= i {
+                let ub = self.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("car_ub"),
+                    size: std::mem::size_of::<Uniforms>() as u64,
+                    usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+                let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: None,
+                    layout: &self.bgl,
+                    entries: &[wgpu::BindGroupEntry { binding: 0, resource: ub.as_entire_binding() }],
+                });
+                self.cpool.push((ub, bg));
+            }
+            let model = Mat4::from_translation(Vec3::new(c.x, c.y, c.z))
+                * Mat4::from_rotation_y(c.yaw)
+                * Mat4::from_rotation_x(c.pitch);
+            let t = ((dist - 265.0) / 70.0).clamp(0.0, 1.0);
+            let hidden = t * t * (3.0 - 2.0 * t);
+            self.queue.write_buffer(
+                &self.cpool[i].0,
+                0,
+                bytemuck::bytes_of(&Uniforms {
+                    vp: (proj * view * model).to_cols_array_2d(),
+                    fog: FOG,
+                    params: [1.0 / 240.0, hidden, 0.0, 0.0],
+                }),
+            );
+            cdraw.push((c.model, i));
+        }
+
         let mut visible: Vec<&Chunk> = Vec::with_capacity(48);
         for (key, chunk) in self.chunks.iter() {
             let cx = (key.0 as f32 + 0.5) * CHUNK - eye.x;
@@ -573,6 +634,14 @@ impl Renderer {
             for &(m, i) in bdraw.iter() {
                 if let Some((vb, count)) = self.bmodels.get(m) {
                     pass.set_bind_group(0, &self.bpool[i].1, &[]);
+                    pass.set_vertex_buffer(0, vb.slice(..));
+                    pass.draw(0..*count, 0..1);
+                }
+            }
+
+            for &(m, i) in cdraw.iter() {
+                if let Some((vb, count)) = self.cmodels.get(m) {
+                    pass.set_bind_group(0, &self.cpool[i].1, &[]);
                     pass.set_vertex_buffer(0, vb.slice(..));
                     pass.draw(0..*count, 0..1);
                 }

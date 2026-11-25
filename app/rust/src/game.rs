@@ -191,6 +191,9 @@ fn tree_at(ix: i32, iz: i32) -> Option<(f32, f32, f32)> {
     if dd < RAIL_OFF + 2.5 {
         return None;
     }
+    if near_building(x, z, 3.0) {
+        return None;
+    }
     let p = (if dd < 70.0 { 0.50 } else { 0.16 }) * TREE_DENSITY;
     if ((h & 0xff) as f32 / 255.0) > p {
         return None;
@@ -467,6 +470,147 @@ fn build_props(x0: f32, z0: f32, out: &mut Vec<Vertex>) {
 }
 
 
+// ------------------------------------------------------------------
+// Roadside buildings (low-poly models from buildings.bin, shared GPU buffers, one draw per building)
+// ------------------------------------------------------------------
+
+static BUILDINGS_BIN: &[u8] = include_bytes!("buildings.bin");
+
+pub struct Model {
+    pub verts: Vec<Vertex>,
+    pub hx: f32,
+    pub hz: f32,
+    pub h: f32,
+}
+
+pub fn models() -> &'static Vec<Model> {
+    static M: std::sync::OnceLock<Vec<Model>> = std::sync::OnceLock::new();
+    M.get_or_init(|| {
+        let d = BUILDINGS_BIN;
+        let rf = |o: usize| f32::from_le_bytes([d[o], d[o + 1], d[o + 2], d[o + 3]]);
+        let mut o = 0usize;
+        let mut v = Vec::new();
+        while o + 20 <= d.len() {
+            let n = u32::from_le_bytes([d[o], d[o + 1], d[o + 2], d[o + 3]]) as usize;
+            let (hx, hz, h) = (rf(o + 4), rf(o + 8), rf(o + 12));
+            o += 20;
+            let mut verts = Vec::with_capacity(n);
+            for _ in 0..n {
+                verts.push(Vertex {
+                    pos: [rf(o), rf(o + 4), rf(o + 8)],
+                    color: [rf(o + 12), rf(o + 16), rf(o + 20)],
+                    kind: 1.0,
+                });
+                o += 24;
+            }
+            v.push(Model { verts, hx, hz, h });
+        }
+        v
+    })
+}
+
+#[derive(Clone, Copy)]
+pub struct Bld {
+    pub model: usize,
+    pub x: f32,
+    pub y: f32,
+    pub z: f32,
+    pub yaw: f32,
+    pub hx: f32,
+    pub hz: f32,
+}
+
+const BLD_CELL: f32 = 200.0;
+/// Which local axis is the facade of each model (true = +x, false = +z).
+const FRONT_X: [bool; 3] = [true, true, false];
+
+fn bld_compute(iz: i32) -> Vec<Bld> {
+    let ms = models();
+    let mut res = Vec::new();
+    if ms.len() < 3 {
+        return res;
+    }
+    let h = hash(iz * 7 + 1, 4242);
+    let r = h % 100;
+    // some stretches have no building, some one, two or three
+    let count = if r < 28 { 0 } else if r < 60 { 1 } else if r < 82 { 2 } else { 3 };
+    let side: f32 = if (h >> 8) & 1 == 0 { 1.0 } else { -1.0 };
+    let mut zr = iz as f32 * BLD_CELL + 25.0 + 50.0 * h01(iz, 31);
+    for k in 0..count {
+        let hk = hash(iz * 11 + k, 777);
+        let mi = (hk % 3) as usize;
+        let m = &ms[mi];
+        let rad = m.hx.max(m.hz);
+        let rp = road_dx(zr);
+        let s = (1.0 + rp * rp).sqrt();
+        let mut best: Option<(f32, f32, f32, f32)> = None;
+        for &off0 in &[24.0f32, 30.0, 38.0, 46.0] {
+            let off = off0 + rad * 0.5;
+            let bx = road_x(zr) + side * off / s;
+            let bz = zr - side * off * rp / s;
+            let mut lo = f32::MAX;
+            let mut hi = f32::MIN;
+            for &(ox, oz) in &[(0.0, 0.0), (rad, rad), (-rad, rad), (rad, -rad), (-rad, -rad)] {
+                let t = terrain_h(bx + ox, bz + oz);
+                lo = lo.min(t);
+                hi = hi.max(t);
+            }
+            if hi - lo < 3.2 {
+                best = Some((bx, bz, lo, rp));
+                break;
+            }
+        }
+        if let Some((bx, bz, lo, rp)) = best {
+            // face the road
+            let (dx, dz) = (-side / s, side * rp / s);
+            let jit = (h01(iz * 5 + k, 99) - 0.5) * 0.16;
+            let yaw = if FRONT_X[mi] { (-dz).atan2(dx) } else { dx.atan2(dz) } + jit;
+            res.push(Bld { model: mi, x: bx, y: lo - 0.3, z: bz, yaw, hx: m.hx, hz: m.hz });
+        }
+        zr += 2.0 * rad + 14.0 + 18.0 * h01(iz * 3 + k, 55);
+    }
+    res
+}
+
+fn bld_cell(iz: i32) -> Vec<Bld> {
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+    thread_local! {
+        static CACHE: RefCell<HashMap<i32, Vec<Bld>>> = RefCell::new(HashMap::new());
+    }
+    CACHE.with(|c| {
+        let mut c = c.borrow_mut();
+        if c.len() > 600 {
+            c.clear();
+        }
+        c.entry(iz).or_insert_with(|| bld_compute(iz)).clone()
+    })
+}
+
+/// All buildings within a few hundred metres (in z) of `z`.
+pub fn buildings_around(z: f32) -> Vec<Bld> {
+    let iz0 = (z / BLD_CELL).floor() as i32;
+    let mut v = Vec::new();
+    for iz in iz0 - 2..=iz0 + 2 {
+        v.extend(bld_cell(iz));
+    }
+    v
+}
+
+fn near_building(x: f32, z: f32, margin: f32) -> bool {
+    let iz0 = (z / BLD_CELL).floor() as i32;
+    for iz in iz0 - 1..=iz0 + 1 {
+        for b in bld_cell(iz) {
+            let r = (b.hx * b.hx + b.hz * b.hz).sqrt() + margin;
+            let (dx, dz) = (x - b.x, z - b.z);
+            if dx * dx + dz * dz < r * r {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 const FLOWER_COLORS: [[f32; 3]; 7] = [
     [0.95, 0.15, 0.20], // red
     [1.00, 0.85, 0.12], // yellow
@@ -497,7 +641,9 @@ fn build_flowers(cx: i32, cz: i32, out: &mut Vec<Vertex>) {
             if ((h & 0xff) as f32 / 255.0) > p {
                 continue;
             }
-            // skip clusters that would sit inside a tree trunk
+            if near_building(px, pz, 3.5) {
+                continue;
+            }
             let col = FLOWER_COLORS[((h >> 24) % 7) as usize];
             let col2 = FLOWER_COLORS[((h >> 27) % 7) as usize];
             // direction towards the road (horizontal)
@@ -918,6 +1064,7 @@ impl Game {
 
         self.rail_collision();
         self.tree_collision();
+        self.building_collision();
 
         // Vertical motion: follow the ground, or fly off crests.
         let g1 = terrain_h(self.pos.x, self.pos.z);
@@ -1008,6 +1155,38 @@ impl Game {
                         self.vel.x -= vn * nx * 1.3;
                         self.vel.z -= vn * nz * 1.3;
                         self.vel = self.vel * 0.6;
+                    }
+                }
+            }
+        }
+    }
+
+    fn building_collision(&mut self) {
+        let iz0 = (self.pos.z / BLD_CELL).floor() as i32;
+        for iz in iz0 - 1..=iz0 + 1 {
+            for b in bld_cell(iz) {
+                let (dx, dz) = (self.pos.x - b.x, self.pos.z - b.z);
+                if dx * dx + dz * dz > 400.0 {
+                    continue;
+                }
+                // into the building's local frame (rotation_y(yaw): local x -> (cos, -sin), local z -> (sin, cos))
+                let (s, c) = b.yaw.sin_cos();
+                let lx = dx * c - dz * s;
+                let lz = dx * s + dz * c;
+                let (ex, ez) = (b.hx + 0.5, b.hz + 0.5);
+                if lx.abs() < ex && lz.abs() < ez {
+                    let (px, pz) = (ex - lx.abs(), ez - lz.abs());
+                    let (nlx, nlz, push) = if px < pz { (lx.signum(), 0.0, px) } else { (0.0, lz.signum(), pz) };
+                    // local normal back to world
+                    let nx = nlx * c + nlz * s;
+                    let nz = -nlx * s + nlz * c;
+                    self.pos.x += nx * push;
+                    self.pos.z += nz * push;
+                    let vn = self.vel.x * nx + self.vel.z * nz;
+                    if vn < 0.0 {
+                        self.vel.x -= vn * nx * 1.2;
+                        self.vel.z -= vn * nz * 1.2;
+                        self.vel = self.vel * 0.5;
                     }
                 }
             }

@@ -6,7 +6,7 @@ use glam::{Mat4, Vec3};
 use wgpu::util::{BufferInitDescriptor, DeviceExt};
 use winit::window::Window;
 
-use crate::game::{build_chunk, Game, Vertex, CHUNK};
+use crate::game::{build_chunk, buildings_around, models, Game, Vertex, CHUNK};
 use crate::hud;
 
 const MAX_BALLOON_VERTS: usize = 3_000;
@@ -59,6 +59,9 @@ pub struct Renderer {
     hud_cache: Vec<Vertex>,
     hud_key: (u32, u32),
     bgl: wgpu::BindGroupLayout,
+    /// Shared building models (vertex buffer, vertex count) and per-instance uniform pool.
+    bmodels: Vec<(wgpu::Buffer, u32)>,
+    bpool: Vec<(wgpu::Buffer, wgpu::BindGroup)>,
 }
 
 fn make_depth(device: &wgpu::Device, w: u32, h: u32) -> wgpu::TextureView {
@@ -259,6 +262,18 @@ impl Renderer {
 
         let depth_view = make_depth(&device, w, h);
 
+        let bmodels: Vec<(wgpu::Buffer, u32)> = models()
+            .iter()
+            .map(|m| {
+                let vb = device.create_buffer_init(&BufferInitDescriptor {
+                    label: Some("building"),
+                    contents: bytemuck::cast_slice(&m.verts),
+                    usage: wgpu::BufferUsages::VERTEX,
+                });
+                (vb, m.verts.len() as u32)
+            })
+            .collect();
+
         Self {
             surface,
             device,
@@ -280,6 +295,8 @@ impl Renderer {
             hud_cache: Vec::new(),
             hud_key: (u32::MAX, 0),
             bgl,
+            bmodels,
+            bpool: Vec::new(),
         }
     }
 
@@ -448,6 +465,51 @@ impl Renderer {
         let eye = g.eye();
         let f = g.forward();
         let tan_h = 35f32.to_radians().tan() * aspect;
+        // ---- roadside buildings: one draw each, own uniforms (view-projection * model) ----
+        let mut bdraw: Vec<(usize, usize)> = Vec::with_capacity(16);
+        for b in buildings_around(eye.z) {
+            let dx = b.x - eye.x;
+            let dz = b.z - eye.z;
+            let dist = (dx * dx + dz * dz).sqrt();
+            if dist > 340.0 {
+                continue;
+            }
+            let along = dx * f.x + dz * f.z;
+            let perp = (dx * f.z - dz * f.x).abs();
+            if dist > 40.0 && (along < -20.0 || perp > along.max(0.0) * tan_h * 1.2 + 40.0) {
+                continue;
+            }
+            let i = bdraw.len();
+            if self.bpool.len() <= i {
+                let ub = self.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("building_ub"),
+                    size: std::mem::size_of::<Uniforms>() as u64,
+                    usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+                let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: None,
+                    layout: &self.bgl,
+                    entries: &[wgpu::BindGroupEntry { binding: 0, resource: ub.as_entire_binding() }],
+                });
+                self.bpool.push((ub, bg));
+            }
+            let model = Mat4::from_translation(Vec3::new(b.x, b.y, b.z)) * Mat4::from_rotation_y(b.yaw);
+            // buildings rise out of the fog as they enter view distance
+            let t = ((dist - 265.0) / 70.0).clamp(0.0, 1.0);
+            let hidden = t * t * (3.0 - 2.0 * t);
+            self.queue.write_buffer(
+                &self.bpool[i].0,
+                0,
+                bytemuck::bytes_of(&Uniforms {
+                    vp: (proj * view * model).to_cols_array_2d(),
+                    fog: FOG,
+                    params: [1.0 / 240.0, hidden, 0.0, 0.0],
+                }),
+            );
+            bdraw.push((b.model, i));
+        }
+
         let mut visible: Vec<&Chunk> = Vec::with_capacity(48);
         for (key, chunk) in self.chunks.iter() {
             let cx = (key.0 as f32 + 0.5) * CHUNK - eye.x;
@@ -506,6 +568,14 @@ impl Renderer {
                 }
                 pass.set_vertex_buffer(0, c.vb.slice(..));
                 pass.draw(0..c.count, 0..1);
+            }
+
+            for &(m, i) in bdraw.iter() {
+                if let Some((vb, count)) = self.bmodels.get(m) {
+                    pass.set_bind_group(0, &self.bpool[i].1, &[]);
+                    pass.set_vertex_buffer(0, vb.slice(..));
+                    pass.draw(0..*count, 0..1);
+                }
             }
 
             pass.set_bind_group(0, &self.world_bg, &[]);

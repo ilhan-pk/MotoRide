@@ -6,7 +6,7 @@ use glam::{Mat4, Vec3};
 use wgpu::util::{BufferInitDescriptor, DeviceExt};
 use winit::window::Window;
 
-use crate::game::{build_chunk, buildings_around, car_models, models, Game, Vertex, CHUNK};
+use crate::game::{build_chunk, buildings_around, car_models, fox_model, models, Game, Vertex, CHUNK, FOX_SCALE};
 use crate::hud;
 
 const MAX_BALLOON_VERTS: usize = 3_000;
@@ -64,6 +64,9 @@ pub struct Renderer {
     bpool: Vec<(wgpu::Buffer, wgpu::BindGroup)>,
     cmodels: Vec<(wgpu::Buffer, u32)>,
     cpool: Vec<(wgpu::Buffer, wgpu::BindGroup)>,
+    fox_vb: wgpu::Buffer,
+    fox_ub: wgpu::Buffer,
+    fox_bg: wgpu::BindGroup,
 }
 
 fn make_depth(device: &wgpu::Device, w: u32, h: u32) -> wgpu::TextureView {
@@ -264,6 +267,22 @@ impl Renderer {
 
         let depth_view = make_depth(&device, w, h);
 
+        let fox_vb = device.create_buffer_init(&BufferInitDescriptor {
+            label: Some("fox"),
+            contents: bytemuck::cast_slice(&fox_model().verts),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+        let fox_ub = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("fox_ub"),
+            size: std::mem::size_of::<Uniforms>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let fox_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &bgl,
+            entries: &[wgpu::BindGroupEntry { binding: 0, resource: fox_ub.as_entire_binding() }],
+        });
         let cmodels: Vec<(wgpu::Buffer, u32)> = car_models()
             .iter()
             .map(|m| {
@@ -312,6 +331,9 @@ impl Renderer {
             bpool: Vec::new(),
             cmodels,
             cpool: Vec::new(),
+            fox_vb,
+            fox_ub,
+            fox_bg,
         }
     }
 
@@ -571,6 +593,34 @@ impl Renderer {
             cdraw.push((c.model, i));
         }
 
+        // ---- fox (one draw, current animation frame) ----
+        let mut fox_draw: Option<(u32, u32)> = None;
+        if let Some(fx) = &g.fox {
+            let m = fox_model();
+            let dx = fx.x - eye.x;
+            let dz = fx.z - eye.z;
+            let dist = (dx * dx + dz * dz).sqrt();
+            let along = dx * f.x + dz * f.z;
+            if dist < 340.0 && along > -15.0 {
+                let model = Mat4::from_translation(Vec3::new(fx.x, fx.y, fx.z))
+                    * Mat4::from_rotation_y(fx.yaw)
+                    * Mat4::from_scale(Vec3::splat(FOX_SCALE));
+                let t = ((dist - 265.0) / 70.0).clamp(0.0, 1.0);
+                let hidden = t * t * (3.0 - 2.0 * t);
+                self.queue.write_buffer(
+                    &self.fox_ub,
+                    0,
+                    bytemuck::bytes_of(&Uniforms {
+                        vp: (proj * view * model).to_cols_array_2d(),
+                        fog: FOG,
+                        params: [1.0 / 240.0, hidden, 0.0, 0.0],
+                    }),
+                );
+                let a = (fx.frame * m.per_frame) as u32;
+                fox_draw = Some((a, a + m.per_frame as u32));
+            }
+        }
+
         let mut visible: Vec<&Chunk> = Vec::with_capacity(48);
         for (key, chunk) in self.chunks.iter() {
             let cx = (key.0 as f32 + 0.5) * CHUNK - eye.x;
@@ -645,6 +695,12 @@ impl Renderer {
                     pass.set_vertex_buffer(0, vb.slice(..));
                     pass.draw(0..*count, 0..1);
                 }
+            }
+
+            if let Some((a, b)) = fox_draw {
+                pass.set_bind_group(0, &self.fox_bg, &[]);
+                pass.set_vertex_buffer(0, self.fox_vb.slice(..));
+                pass.draw(a..b, 0..1);
             }
 
             pass.set_bind_group(0, &self.world_bg, &[]);

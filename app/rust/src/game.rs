@@ -488,6 +488,95 @@ fn build_props(x0: f32, z0: f32, out: &mut Vec<Vertex>) {
 
 
 // ------------------------------------------------------------------
+// Fox: baked gallop animation (16 frames), crosses the road now and then. Harmless: no collision.
+// ------------------------------------------------------------------
+
+static FOX_BIN: &[u8] = include_bytes!("fox.bin");
+
+pub struct FoxModel {
+    /// all frames, one after another (`per_frame` vertices each)
+    pub verts: Vec<Vertex>,
+    pub per_frame: usize,
+    pub frames: usize,
+}
+
+pub fn fox_model() -> &'static FoxModel {
+    static M: std::sync::OnceLock<FoxModel> = std::sync::OnceLock::new();
+    M.get_or_init(|| {
+        let d = FOX_BIN;
+        let u32at = |o: usize| u32::from_le_bytes([d[o], d[o + 1], d[o + 2], d[o + 3]]) as usize;
+        let f32at = |o: usize| f32::from_le_bytes([d[o], d[o + 1], d[o + 2], d[o + 3]]);
+        let nf = u32at(0);
+        let nv = u32at(4);
+        let ni = u32at(8);
+        let mut o = 24usize;
+        let col_o = o;
+        o += nv * 3;
+        o = (o + 3) & !3;
+        let idx_o = o;
+        o += ni * 2;
+        o = (o + 3) & !3;
+        let pos_o = o;
+        let mut verts = Vec::with_capacity(nf * ni);
+        for f in 0..nf {
+            let base = pos_o + f * nv * 12;
+            let p = |i: usize| -> [f32; 3] {
+                let q = base + i * 12;
+                [f32at(q), f32at(q + 4), f32at(q + 8)]
+            };
+            for t in 0..ni / 3 {
+                let ix = |k: usize| {
+                    let q = idx_o + (t * 3 + k) * 2;
+                    u16::from_le_bytes([d[q], d[q + 1]]) as usize
+                };
+                let (a, b, c) = (ix(0), ix(1), ix(2));
+                let (pa, pb, pc) = (p(a), p(b), p(c));
+                let e1 = [pb[0] - pa[0], pb[1] - pa[1], pb[2] - pa[2]];
+                let e2 = [pc[0] - pa[0], pc[1] - pa[1], pc[2] - pa[2]];
+                let n = [
+                    e1[1] * e2[2] - e1[2] * e2[1],
+                    e1[2] * e2[0] - e1[0] * e2[2],
+                    e1[0] * e2[1] - e1[1] * e2[0],
+                ];
+                let len = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt().max(1e-9);
+                let shade = 0.80 + 0.20 * (n[1] / len).abs();
+                for &vi in &[a, b, c] {
+                    let q = col_o + vi * 3;
+                    verts.push(Vertex {
+                        pos: p(vi),
+                        color: [
+                            d[q] as f32 / 255.0 * shade,
+                            d[q + 1] as f32 / 255.0 * shade,
+                            d[q + 2] as f32 / 255.0 * shade,
+                        ],
+                        kind: 1.0,
+                    });
+                }
+            }
+        }
+        FoxModel { verts, per_frame: ni, frames: nf }
+    })
+}
+
+pub const FOX_SCALE: f32 = 1.3;
+const FOX_ANIM_FPS: f32 = 29.5;
+
+#[derive(Clone, Copy)]
+pub struct Fox {
+    pub x: f32,
+    pub y: f32,
+    pub z: f32,
+    pub yaw: f32,
+    pub frame: usize,
+    zr: f32,
+    side: f32, // direction of travel across the road (+1 = towards +x side)
+    off: f32,  // lateral offset from the road centre (m)
+    t: f32,
+    speed: f32,
+}
+
+
+// ------------------------------------------------------------------
 // One-way traffic (4 low-poly car models, shared GPU buffers, one draw per car)
 // ------------------------------------------------------------------
 
@@ -1173,6 +1262,8 @@ pub struct Game {
     spin: f32,
     pub cars: Vec<Car>,
     rng: u32,
+    pub fox: Option<Fox>,
+    fox_timer: f32,
 }
 
 impl Game {
@@ -1202,6 +1293,8 @@ impl Game {
             spin: 0.0,
             cars,
             rng,
+            fox: None,
+            fox_timer: 8.0,
         }
     }
 
@@ -1298,6 +1391,7 @@ impl Game {
         self.pos.z += self.vel.z * dt;
 
         self.update_cars(dt);
+        self.update_fox(dt);
         self.rail_collision();
         self.tree_collision();
         self.building_collision();
@@ -1398,6 +1492,67 @@ impl Game {
         self.susp_v -= impact * 0.32;
         self.rider[1] -= (impact * 0.012).min(0.12);
         self.vy = 0.0;
+    }
+
+    /// A fox now and then gallops across the road ahead. It is only scenery: the bike cannot hit it.
+    fn update_fox(&mut self, dt: f32) {
+        if fox_model().frames == 0 {
+            return;
+        }
+        let f = self.forward();
+        let bz = self.pos.z;
+        if let Some(fx) = &mut self.fox {
+            fx.t += dt;
+            fx.off += fx.side * fx.speed * dt;
+            fx.frame = ((fx.t * FOX_ANIM_FPS) as usize) % fox_model().frames;
+            let rp = road_dx(fx.zr);
+            let s = (1.0 + rp * rp).sqrt();
+            fx.x = road_x(fx.zr) + fx.off / s;
+            fx.z = fx.zr - fx.off * rp / s;
+            let ao = fx.off.abs();
+            let target = if ao < ROAD_HALF + 0.7 {
+                road_target(fx.zr) + 0.20
+            } else if ao < 11.5 {
+                road_target(fx.zr) + 0.16
+            } else {
+                mesh_h(fx.x, fx.z)
+            };
+            fx.y += (target - fx.y) * (dt * 14.0).min(1.0);
+            let (hx, hz) = (fx.side / s, -fx.side * rp / s);
+            fx.yaw = (-hx).atan2(-hz);
+            // done: crossed the road, or the bike left it far behind
+            if ao > 19.0 || fx.z - bz > 80.0 {
+                self.fox = None;
+                self.fox_timer = 14.0 + 26.0 * rnd(&mut self.rng);
+            }
+            return;
+        }
+        self.fox_timer -= dt;
+        if self.fox_timer <= 0.0 {
+            if self.speed < 6.0 || f.z > -0.3 {
+                self.fox_timer = 2.0; // wait until the bike is rolling along the road
+                return;
+            }
+            // appear far ahead (visible from a distance), timed so it crosses as the bike arrives
+            let d = (self.speed * (1.9 + 2.6 * rnd(&mut self.rng))).clamp(80.0, 260.0);
+            let zr = bz - d;
+            let side = if rnd(&mut self.rng) < 0.5 { 1.0 } else { -1.0 };
+            let speed = 9.0 + 3.5 * rnd(&mut self.rng);
+            let mut fx = Fox {
+                x: 0.0,
+                y: road_target(zr),
+                z: zr,
+                yaw: 0.0,
+                frame: 0,
+                zr,
+                side,
+                off: -side * 18.0,
+                t: 0.0,
+                speed,
+            };
+            fx.x = road_x(zr);
+            self.fox = Some(fx);
+        }
     }
 
     /// Move the traffic: slower on climbs, faster downhill, queueing behind slower cars in the same lane.

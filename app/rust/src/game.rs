@@ -206,12 +206,22 @@ fn mix(a: [f32; 3], b: [f32; 3], t: f32) -> [f32; 3] {
     [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t]
 }
 
+/// Muddy patches away from the road (0..1).
+fn mud_amount(x: f32, z: f32) -> f32 {
+    if road_off(x, z) < 14.0 {
+        return 0.0;
+    }
+    smooth(0.66, 0.78, vnoise(x / 26.0 + 40.0, z / 26.0 - 12.0))
+}
+
 fn terrain_color(x: f32, z: f32, slope: f32) -> [f32; 3] {
     let patch = vnoise(x / 45.0 + 3.0, z / 45.0 - 8.0);
     let t = ((patch - 0.35) / 0.3).clamp(0.0, 1.0);
     let mut c = mix([0.50, 0.78, 0.26], [0.62, 0.87, 0.34], t);
     let fine = vnoise(x / 9.0, z / 9.0);
     c = mix(c, [0.56, 0.82, 0.30], fine * 0.25);
+    let mud = mud_amount(x, z);
+    c = mix(c, [0.45, 0.32, 0.20], mud * 0.92);
     let rock = ((slope - 0.45) / 0.3).clamp(0.0, 1.0);
     mix(c, [0.50, 0.50, 0.44], rock * 0.55)
 }
@@ -407,11 +417,18 @@ fn build_props(x0: f32, z0: f32, out: &mut Vec<Vertex>) {
             if !in_chunk(cx, cz, x0, z0) {
                 continue;
             }
-            let gy = road_target(zr);
-            let m = Mat4::from_translation(Vec3::new(cx, gy, cz)) * Mat4::from_rotation_y(rp.atan());
-            push_box(out, m, Vec3::new(0.0, 0.62, 0.0), Vec3::new(0.05, 0.17, BLOCK * 0.48), [0.60, 0.65, 0.70]);
-            push_box(out, m, Vec3::new(0.0, 0.34, 0.0), Vec3::new(0.04, 0.08, BLOCK * 0.48), [0.52, 0.57, 0.62]);
-            push_box(out, m, Vec3::new(0.0, 0.40, 0.0), Vec3::new(0.06, 0.40, 0.06), [0.40, 0.44, 0.48]);
+            // follow the road's slope (pitch) and sit on the sunk verge
+            let gy = road_target(zr) - 0.22;
+            let slope_z = (road_target(zr + 2.0) - road_target(zr - 2.0)) / 4.0;
+            let pitch = -(slope_z / s).atan();
+            let m = Mat4::from_translation(Vec3::new(cx, gy, cz))
+                * Mat4::from_rotation_y(rp.atan())
+                * Mat4::from_rotation_x(pitch);
+            push_box(out, m, Vec3::new(0.0, 0.66, 0.0), Vec3::new(0.05, 0.17, BLOCK * 0.5), [0.66, 0.71, 0.76]);
+            push_box(out, m, Vec3::new(0.0, 0.36, 0.0), Vec3::new(0.04, 0.08, BLOCK * 0.5), [0.52, 0.57, 0.62]);
+            for &pz in &[-BLOCK * 0.42, BLOCK * 0.42] {
+                push_box(out, m, Vec3::new(0.0, 0.28, pz), Vec3::new(0.06, 0.58, 0.06), [0.40, 0.44, 0.48]);
+            }
         }
     }
 
@@ -641,7 +658,7 @@ fn build_flowers(cx: i32, cz: i32, out: &mut Vec<Vertex>) {
             if ((h & 0xff) as f32 / 255.0) > p {
                 continue;
             }
-            if near_building(px, pz, 3.5) {
+            if near_building(px, pz, 3.5) || mud_amount(px, pz) > 0.25 {
                 continue;
             }
             let col = FLOWER_COLORS[((h >> 24) % 7) as usize];
@@ -950,6 +967,64 @@ fn push_blob(
 // Bike
 // ------------------------------------------------------------------
 
+/// Ground surface under the wheels.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Surf {
+    Asphalt,
+    Sand,
+    Grass,
+    Mud,
+    Rock,
+}
+
+struct SurfP {
+    /// tyre grip coefficient
+    mu: f32,
+    /// rolling resistance
+    drag: f32,
+    /// bump amplitude (m) fed into the suspension
+    rough: f32,
+}
+
+fn surf_params(s: Surf) -> SurfP {
+    match s {
+        Surf::Asphalt => SurfP { mu: 1.10, drag: 0.00, rough: 0.004 },
+        Surf::Sand => SurfP { mu: 0.62, drag: 0.16, rough: 0.020 },
+        Surf::Grass => SurfP { mu: 0.80, drag: 0.09, rough: 0.035 },
+        Surf::Mud => SurfP { mu: 0.50, drag: 0.26, rough: 0.055 },
+        Surf::Rock => SurfP { mu: 0.85, drag: 0.07, rough: 0.100 },
+    }
+}
+
+fn surface_at(x: f32, z: f32, slope: f32) -> Surf {
+    let zr = road_param(x, z);
+    let dxr = x - road_x(zr);
+    let dzr = z - zr;
+    let off = (dxr * dxr + dzr * dzr).sqrt();
+    if off < ROAD_HALF + 0.7 {
+        return Surf::Asphalt;
+    }
+    let side = if dxr >= 0.0 { 1 } else { -1 };
+    if off < ROAD_HALF + 0.7 + sand_w(zr, side) {
+        return Surf::Sand;
+    }
+    if slope > 0.62 {
+        return Surf::Rock;
+    }
+    if mud_amount(x, z) > 0.5 {
+        Surf::Mud
+    } else {
+        Surf::Grass
+    }
+}
+
+/// Small deterministic ground bumps (suspension input).
+fn bump(x: f32, z: f32, amp: f32) -> f32 {
+    let a = vnoise(x * 0.16 + 7.1, z * 0.16 - 3.3) - 0.5;
+    let b = vnoise(x * 0.55 - 1.9, z * 0.55 + 8.4) - 0.5;
+    (a * 1.4 + b * 0.6) * amp * 2.0
+}
+
 pub struct Game {
     /// Contact point with the ground (x, ground height, z).
     pub pos: Vec3,
@@ -959,9 +1034,24 @@ pub struct Game {
     pub yaw: f32,
     pub speed: f32,
     pub steer: f32,
+    /// Bike lean angle (rad, + = right).
     pub lean: f32,
+    /// Camera roll (rad) derived from the lean.
+    pub roll: f32,
+    /// Camera pitch (rad): slope / flight attitude + weight transfer.
     pub pitch: f32,
     pub grounded: bool,
+    pub surf: Surf,
+    // suspension (body height offset, m)
+    susp: f32,
+    susp_v: f32,
+    bump_prev: f32,
+    // body attitude and filtered longitudinal acceleration
+    body_pitch: f32,
+    ax: f32,
+    // rider body offset relative to the bike (right, up, forward) in metres
+    pub rider: [f32; 3],
+    spin: f32,
 }
 
 impl Game {
@@ -976,8 +1066,17 @@ impl Game {
             speed: 0.0,
             steer: 0.0,
             lean: 0.0,
+            roll: 0.0,
             pitch: 0.0,
             grounded: true,
+            surf: Surf::Asphalt,
+            susp: 0.0,
+            susp_v: 0.0,
+            bump_prev: 0.0,
+            body_pitch: 0.0,
+            ax: 0.0,
+            rider: [0.0; 3],
+            spin: 0.0,
         }
     }
 
@@ -985,8 +1084,16 @@ impl Game {
         Vec3::new(-self.yaw.sin(), 0.0, -self.yaw.cos())
     }
 
+    /// The rider's head: bike position + rider body movement + suspension travel.
     pub fn eye(&self) -> Vec3 {
-        Vec3::new(self.pos.x, self.pos.y + 1.25, self.pos.z)
+        let f = self.forward();
+        let r = Vec3::new(self.yaw.cos(), 0.0, -self.yaw.sin());
+        let up = 1.25 + self.susp + self.rider[1];
+        Vec3::new(
+            self.pos.x + r.x * self.rider[0] + f.x * self.rider[2],
+            self.pos.y + up,
+            self.pos.z + r.z * self.rider[0] + f.z * self.rider[2],
+        )
     }
 
     pub fn look_dir(&self) -> Vec3 {
@@ -998,54 +1105,62 @@ impl Game {
     pub fn update(&mut self, input: &Input, dt: f32) {
         let f = self.forward();
         let r = Vec3::new(self.yaw.cos(), 0.0, -self.yaw.sin());
-        let mut vf = self.vel.dot(f);
-        let mut vr = self.vel.dot(r);
-
-        let dperp = road_dist(self.pos.x, self.pos.z);
-        let on_road = dperp < ROAD_HALF + 0.3;
-        let on_sand = !on_road && dperp < ROAD_HALF + 4.0;
+        let (gx, gz) = grad(self.pos.x, self.pos.z);
+        let slope = (gx * gx + gz * gz).sqrt();
+        self.surf = surface_at(self.pos.x, self.pos.z, slope);
+        let sp = surf_params(self.surf);
 
         self.steer += (input.steer - self.steer) * (dt * 7.0).min(1.0);
 
+        let mut vf = self.vel.dot(f);
+        let vf_before = vf;
+        let slope_f = gx * f.x + gz * f.z; // rise per metre along the heading
+        let cos_s = 1.0 / (1.0 + slope_f * slope_f).sqrt();
+
+        // ---------------- longitudinal: engine, brakes, traction, weight transfer ----------------
         if self.grounded {
-            let accel = if input.throttle { 17.0 * (1.0 - vf / MAX_SPEED).max(0.0) } else { 0.0 };
-            vf += accel * dt;
+            let engine = if input.throttle { 17.0 * (1.0 - vf / MAX_SPEED).max(0.0) } else { 0.0 };
+            // rear tyre grip limits drive; braking also loads the front tyre (more stopping grip)
+            let drive_lim = sp.mu * G * 1.15 * cos_s;
+            self.spin += (if engine > drive_lim { 1.0 } else { 0.0 } - self.spin) * (dt * 6.0).min(1.0);
+            vf += engine.min(drive_lim) * dt;
             if input.brake && vf > 0.0 {
-                vf = (vf - 32.0 * dt).max(0.0);
+                vf = (vf - sp.mu * G * 1.5 * cos_s * dt).max(0.0);
             }
             if !input.throttle && vf > 0.0 {
                 vf = (vf - 1.2 * dt).max(0.0); // engine braking
             }
-            let surface_drag = if on_road {
-                0.0
-            } else if on_sand {
-                0.07
-            } else {
-                0.12
-            };
-            vf -= (0.035 + surface_drag) * vf * dt;
+            vf -= (0.035 + sp.drag) * vf * dt;
             if vf < 0.0 {
                 vf -= 2.0 * vf * dt; // rolling backwards stops quickly
             }
-
-            // Grip: best on asphalt; the bike slides when turned hard at speed.
-            let grip = if on_road {
-                4.5
-            } else if on_sand {
-                3.0
-            } else {
-                2.4
-            };
-            let slide = 1.0 / (1.0 + self.steer.abs() * vf.abs() / 22.0);
-            vr *= (-grip * slide * dt).exp();
-
-            self.vel = f * vf + r * vr;
-
-            // Gravity along the slope.
-            let (gx, gz) = grad(self.pos.x, self.pos.z);
-            self.vel.x -= gx * G * 0.7 * dt;
-            self.vel.z -= gz * G * 0.7 * dt;
+            // hills: gravity along the slope
+            vf -= slope_f * cos_s * G * 0.7 * dt;
         } else {
+            self.spin = 0.0;
+        }
+
+        // ---------------- steering: lean-based, grip-limited (understeer instead of skidding) ----------------
+        let curv = self.steer * 0.085 / (1.0 + vf * vf / 1100.0);
+        let ctrl = if self.grounded { 1.0 } else { 0.15 };
+        let mut yawrate = curv * vf * ctrl;
+        if self.grounded {
+            let lat = yawrate * vf;
+            let lat_max = sp.mu * G * 1.6;
+            if lat.abs() > lat_max {
+                let k = lat_max / lat.abs();
+                yawrate *= k;
+                vf -= vf * (1.0 - k) * 0.25 * dt; // tyres scrub speed, but never slide sideways
+            }
+        }
+        self.yaw -= yawrate * dt;
+
+        if self.grounded {
+            // no sideways sliding: velocity always follows the wheels
+            self.vel = f * vf;
+        } else {
+            // in the air momentum is kept
+            let vr = self.vel.dot(r);
             self.vel = f * vf + r * vr;
         }
 
@@ -1054,11 +1169,6 @@ impl Game {
             self.vel = self.vel.normalize() * vmax;
         }
 
-        // Steering: curvature drops with speed, so high speed feels stable.
-        let curv = self.steer * 0.085 / (1.0 + vf * vf / 1100.0);
-        let ctrl = if self.grounded { 1.0 } else { 0.15 };
-        self.yaw -= curv * vf * ctrl * dt;
-
         self.pos.x += self.vel.x * dt;
         self.pos.z += self.vel.z * dt;
 
@@ -1066,7 +1176,7 @@ impl Game {
         self.tree_collision();
         self.building_collision();
 
-        // Vertical motion: follow the ground, or fly off crests.
+        // ---------------- vertical: follow the ground or fly (jumps) ----------------
         let g1 = terrain_h(self.pos.x, self.pos.z);
         self.vy -= G * dt;
         let y_new = self.pos.y + self.vy * dt;
@@ -1074,10 +1184,7 @@ impl Game {
             if self.grounded {
                 self.vy = ((g1 - self.pos.y) / dt).clamp(-25.0, 25.0);
             } else {
-                if -self.vy > 8.0 {
-                    self.vel = self.vel * 0.88; // hard landing
-                }
-                self.vy = 0.0;
+                self.land(g1);
             }
             self.pos.y = g1;
             self.grounded = true;
@@ -1087,18 +1194,83 @@ impl Game {
         }
 
         self.speed = self.vel.length();
-
-        let target_lean = self.steer * (self.speed / 22.0).min(1.0);
-        self.lean += (target_lean - self.lean) * (dt * 5.0).min(1.0);
-
         let f2 = self.forward();
-        let (gx, gz) = grad(self.pos.x, self.pos.z);
-        let target_pitch = if self.grounded {
-            (gx * f2.x + gz * f2.z).atan()
+        let vf_now = self.vel.dot(f2);
+
+        // ---------------- weight transfer (filtered longitudinal acceleration) ----------------
+        let ax_raw = ((vf_now - vf_before) / dt.max(1e-3)).clamp(-40.0, 40.0);
+        self.ax += (ax_raw - self.ax) * (dt * 7.0).min(1.0);
+        let wt = (self.ax / (G * 1.5)).clamp(-1.0, 1.0); // + accelerating, - braking
+
+        // ---------------- lean ----------------
+        let lat_acc = yawrate * vf_now;
+        let lean_t = ((lat_acc / G).atan() + self.steer * 0.2 * (vf_now / 8.0).clamp(0.0, 1.0))
+            .clamp(-0.75, 0.75)
+            * if self.grounded { 1.0 } else { 0.3 };
+        self.lean += (lean_t - self.lean) * (dt * 6.0).min(1.0);
+        self.roll = self.lean * 0.42;
+
+        // ---------------- suspension: spring + damper driven by bumps ----------------
+        let w_in = if self.grounded { bump(self.pos.x, self.pos.z, sp.rough) } else { 0.0 };
+        let w_v = (w_in - self.bump_prev) / dt.max(1e-3);
+        self.bump_prev = w_in;
+        const K: f32 = 150.0;
+        const C: f32 = 17.0;
+        let acc = -K * (self.susp - w_in) - C * (self.susp_v - w_v.clamp(-3.0, 3.0));
+        self.susp_v += acc * dt;
+        self.susp += self.susp_v * dt;
+        if self.susp < -0.30 {
+            self.susp = -0.30; // bottomed out
+            self.susp_v = self.susp_v.max(0.0);
+        }
+        if self.susp > 0.18 {
+            self.susp = 0.18;
+            self.susp_v = self.susp_v.min(0.0);
+        }
+
+        // ---------------- body attitude: slope on the ground, flight path + rider control in the air ----------------
+        let slope_pitch = (gx * f2.x + gz * f2.z).atan();
+        if self.grounded {
+            self.body_pitch += (slope_pitch.clamp(-0.7, 0.7) - self.body_pitch) * (dt * 7.0).min(1.0);
         } else {
-            self.vy.atan2(vf.abs().max(3.0)) * 0.6
-        };
-        self.pitch += (target_pitch.clamp(-0.6, 0.6) - self.pitch) * (dt * 5.0).min(1.0);
+            let flight = self.vy.atan2(vf_now.abs().max(3.0));
+            let mut target = flight * 0.85;
+            if input.throttle {
+                target += 0.35; // gas in the air: nose up
+            }
+            if input.brake {
+                target -= 0.35; // rear brake: nose down
+            }
+            self.body_pitch += (target.clamp(-0.9, 0.9) - self.body_pitch) * (dt * 1.6).min(1.0);
+        }
+        // squat when accelerating, dive when braking
+        self.pitch = self.body_pitch + wt * 0.06 + (self.susp_v * 0.01).clamp(-0.03, 0.03);
+
+        // ---------------- rider body ----------------
+        let tuck = (vf_now / MAX_SPEED).clamp(0.0, 1.0);
+        let tx = self.lean * 0.34;
+        let ty = -self.lean.abs() * 0.10 - tuck * 0.07 - wt.min(0.0).abs() * 0.04 + self.susp * -0.35;
+        let tz = if wt < 0.0 { -wt * 0.16 } else { -wt * 0.10 } - tuck * 0.05;
+        let k = (dt * 5.0).min(1.0);
+        self.rider[0] += (tx - self.rider[0]) * k;
+        self.rider[1] += (ty - self.rider[1]) * k;
+        self.rider[2] += (tz - self.rider[2]) * k;
+    }
+
+    /// Touchdown after a jump: the suspension absorbs the hit; a bad attitude or a huge drop costs speed.
+    fn land(&mut self, g1: f32) {
+        let (gx, gz) = grad(self.pos.x, self.pos.z);
+        let n = Vec3::new(-gx, 1.0, -gz).normalize();
+        let v = Vec3::new(self.vel.x, self.vy, self.vel.z);
+        let impact = (-v.dot(n)).max(0.0);
+        let f = self.forward();
+        let slope_pitch = (gx * f.x + gz * f.z).atan();
+        let mism = (self.body_pitch - slope_pitch).abs();
+        let sev = ((impact - 7.0) / 14.0).clamp(0.0, 1.0) * 0.45 + ((mism - 0.35) / 0.6).clamp(0.0, 1.0) * 0.45;
+        self.vel = self.vel * (1.0 - sev);
+        self.susp_v -= impact * 0.32;
+        self.rider[1] -= (impact * 0.012).min(0.12);
+        self.vy = 0.0;
     }
 
     /// Solid guard rails along the track (they have gaps, so you can leave it).
@@ -1229,7 +1401,12 @@ impl Game {
     pub fn build_cockpit(&self, out: &mut Vec<Vertex>) {
         let dark = [0.09, 0.10, 0.11];
         let red = [0.72, 0.23, 0.20];
-        let base = Mat4::from_translation(Vec3::new(0.0, -0.40, -1.1))
+        // the bars move against the rider's head: lean, weight shift and suspension travel
+        let sx = -self.rider[0] * 0.6;
+        let sy = -(self.rider[1] + self.susp * 0.5) * 0.6;
+        let sz = self.rider[2] * 0.6;
+        let base = Mat4::from_translation(Vec3::new(sx, -0.40 + sy, -1.1 + sz))
+            * Mat4::from_rotation_z(-self.rider[0] * 0.25)
             * Mat4::from_rotation_y(-self.steer * 0.35)
             * Mat4::from_rotation_x(0.25);
         push_box(out, base, Vec3::ZERO, Vec3::new(0.55, 0.03, 0.035), dark); // bar

@@ -378,7 +378,7 @@ impl Renderer {
     pub fn render(&mut self, g: &Game, fps: u32) {
         let aspect = self.config.width as f32 / self.config.height as f32;
         let proj = Mat4::perspective_rh(70f32.to_radians(), aspect, 0.3, 2000.0);
-        let view = Mat4::from_rotation_z(g.lean * 0.28) * Mat4::look_to_rh(g.eye(), g.look_dir(), Vec3::Y);
+        let view = Mat4::from_rotation_z(g.roll) * Mat4::look_to_rh(g.eye(), g.look_dir(), Vec3::Y);
 
         self.queue.write_buffer(
             &self.world_ub,

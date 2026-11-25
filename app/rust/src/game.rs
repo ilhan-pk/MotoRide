@@ -27,6 +27,8 @@ const LAMP: f32 = 48.0;
 const SIGN: f32 = 24.0;
 /// Set to false to remove all trees.
 const TREES: bool = true;
+/// 1.0 = full forest. Lower (e.g. 0.5) if the FPS counter shows a slow phone.
+const TREE_DENSITY: f32 = 1.0;
 
 #[derive(Default)]
 pub struct Input {
@@ -71,12 +73,16 @@ fn vnoise(x: f32, z: f32) -> f32 {
     top + (bot - top) * v
 }
 
-/// Gentle rolling ground.
+/// Big hills only (the road follows these, so the track stays smooth).
+fn base_h(x: f32, z: f32) -> f32 {
+    (vnoise(x / 240.0, z / 240.0) - 0.5) * 72.0
+}
+
+/// Steep rolling hills: big hills + medium ridges + small bumps.
 fn natural(x: f32, z: f32) -> f32 {
-    let n = vnoise(x / 300.0, z / 300.0) * 0.66
-        + vnoise(x / 110.0 + 17.3, z / 110.0 - 9.1) * 0.27
-        + vnoise(x / 60.0 - 3.7, z / 60.0 + 5.2) * 0.07;
-    (n - 0.5) * 20.0
+    base_h(x, z)
+        + (vnoise(x / 95.0 + 17.3, z / 95.0 - 9.1) - 0.5) * 22.0
+        + (vnoise(x / 40.0 - 3.7, z / 40.0 + 5.2) - 0.5) * 4.5
 }
 
 /// The race track winds along the z axis forever (S-bends).
@@ -95,22 +101,39 @@ fn road_ddx(z: f32) -> f32 {
 }
 
 fn road_target(z: f32) -> f32 {
-    natural(road_x(z), z)
+    base_h(road_x(z), z)
+}
+
+/// Road parameter (z along the centre line) of the centre-line point nearest to (x, z).
+fn road_param(x: f32, z: f32) -> f32 {
+    let mut zr = z;
+    for _ in 0..3 {
+        zr = z + (x - road_x(zr)) * road_dx(zr);
+    }
+    zr
 }
 
 pub fn terrain_h(x: f32, z: f32) -> f32 {
     let nat = natural(x, z);
-    let dx = (x - road_x(z)).abs();
-    if dx >= 44.0 {
+    // cheap reject for points far from the road
+    if (x - road_x(z)).abs() >= 80.0 {
         return nat;
     }
-    let w = if dx <= 22.0 {
+    let zr = road_param(x, z);
+    let dxr = x - road_x(zr);
+    let dzr = z - zr;
+    let dist = (dxr * dxr + dzr * dzr).sqrt();
+    if dist >= 60.0 {
+        return nat;
+    }
+    // Flat across the road (height depends only on the nearest road point), blending into the hills.
+    let w = if dist <= 30.0 {
         1.0
     } else {
-        let t = (dx - 22.0) / 22.0;
+        let t = (dist - 30.0) / 30.0;
         1.0 - t * t * (3.0 - 2.0 * t)
     };
-    nat + (road_target(z) - nat) * w
+    nat + (road_target(zr) - nat) * w
 }
 
 fn grad(x: f32, z: f32) -> (f32, f32) {
@@ -145,7 +168,7 @@ fn tree_at(ix: i32, iz: i32) -> Option<(f32, f32, f32)> {
     if dd < RAIL_OFF + 2.5 {
         return None;
     }
-    let p = if dd < 70.0 { 0.50 } else { 0.16 };
+    let p = (if dd < 70.0 { 0.50 } else { 0.16 }) * TREE_DENSITY;
     if ((h & 0xff) as f32 / 255.0) > p {
         return None;
     }
@@ -163,8 +186,8 @@ fn terrain_color(x: f32, z: f32, slope: f32) -> [f32; 3] {
     let mut c = mix([0.50, 0.78, 0.26], [0.62, 0.87, 0.34], t);
     let fine = vnoise(x / 9.0, z / 9.0);
     c = mix(c, [0.56, 0.82, 0.30], fine * 0.25);
-    let rock = ((slope - 0.28) / 0.2).clamp(0.0, 1.0);
-    mix(c, [0.52, 0.55, 0.40], rock * 0.6)
+    let rock = ((slope - 0.45) / 0.3).clamp(0.0, 1.0);
+    mix(c, [0.50, 0.50, 0.44], rock * 0.55)
 }
 
 fn sand_w(z: f32, side: i32) -> f32 {
@@ -294,14 +317,14 @@ fn build_ribbon(x0: f32, z0: f32, out: &mut Vec<Vertex>) {
         // asphalt
         quad(
             out,
-            [pt(a, -ROAD_HALF, 0.16), pt(a, ROAD_HALF, 0.16), pt(b, ROAD_HALF, 0.16), pt(b, -ROAD_HALF, 0.16)],
+            [pt(a, -ROAD_HALF, 0.20), pt(a, ROAD_HALF, 0.20), pt(b, ROAD_HALF, 0.20), pt(b, -ROAD_HALF, 0.20)],
             scale([0.56, 0.61, 0.66], tint),
         );
         // white edge lines
         for &sd in &[-1.0f32, 1.0] {
             let o0 = sd * (ROAD_HALF - 0.38);
             let o1 = sd * (ROAD_HALF - 0.15);
-            quad(out, [pt(a, o0, 0.2), pt(a, o1, 0.2), pt(b, o1, 0.2), pt(b, o0, 0.2)], [0.96, 0.96, 0.96]);
+            quad(out, [pt(a, o0, 0.24), pt(a, o1, 0.24), pt(b, o1, 0.24), pt(b, o0, 0.24)], [0.96, 0.96, 0.96]);
         }
         // sand run-off (varying width)
         let sand = scale([0.93, 0.82, 0.58], tint);
@@ -309,7 +332,7 @@ fn build_ribbon(x0: f32, z0: f32, out: &mut Vec<Vertex>) {
             let i0 = -(ROAD_HALF + 0.7);
             quad(
                 out,
-                [pt(a, i0, 0.10), pt(a, i0 - a.wl, 0.10), pt(b, i0 - b.wl, 0.10), pt(b, i0, 0.10)],
+                [pt(a, i0, 0.16), pt(a, i0 - a.wl, 0.16), pt(b, i0 - b.wl, 0.16), pt(b, i0, 0.16)],
                 sand,
             );
         }
@@ -317,7 +340,7 @@ fn build_ribbon(x0: f32, z0: f32, out: &mut Vec<Vertex>) {
             let i0 = ROAD_HALF + 0.7;
             quad(
                 out,
-                [pt(a, i0, 0.10), pt(a, i0 + a.wr, 0.10), pt(b, i0 + b.wr, 0.10), pt(b, i0, 0.10)],
+                [pt(a, i0, 0.16), pt(a, i0 + a.wr, 0.16), pt(b, i0 + b.wr, 0.16), pt(b, i0, 0.16)],
                 sand,
             );
         }
@@ -327,7 +350,7 @@ fn build_ribbon(x0: f32, z0: f32, out: &mut Vec<Vertex>) {
             let o0 = sd * ROAD_HALF;
             let o1 = sd * (ROAD_HALF + 1.3);
             let c = if idx & 1 == 0 { [0.12, 0.12, 0.14] } else { [0.96, 0.96, 0.96] };
-            quad(out, [pt(a, o0, 0.2), pt(a, o1, 0.2), pt(b, o1, 0.2), pt(b, o0, 0.2)], c);
+            quad(out, [pt(a, o0, 0.24), pt(a, o1, 0.24), pt(b, o1, 0.24), pt(b, o0, 0.24)], c);
         }
     }
 }
@@ -416,26 +439,191 @@ fn build_props(x0: f32, z0: f32, out: &mut Vec<Vertex>) {
     }
 }
 
-/// Low-poly trees: tall dark trunk and three faceted canopy blobs.
+/// Realistic trees: tapered trunks, branches and soft smooth-shaded leaf clusters.
 fn build_trees(cx: i32, cz: i32, out: &mut Vec<Vertex>) {
     for ix in cx * TPC..cx * TPC + TPC {
         for iz in cz * TPC..cz * TPC + TPC {
             let Some((x, z, s)) = tree_at(ix, iz) else { continue };
-            let h = hash(ix, iz);
             let gy = terrain_h(x, z);
-            let th = 6.5 * s;
-            let yaw = (h & 0xff) as f32 / 255.0 * 6.283;
-            let m = Mat4::from_translation(Vec3::new(x, gy + th * 0.5 - 0.2, z)) * Mat4::from_rotation_y(yaw);
-            push_box(out, m, Vec3::ZERO, Vec3::new(0.28 * s, th * 0.5 + 0.2, 0.28 * s), [0.24, 0.14, 0.11]);
+            push_tree(out, x, gy, z, s, hash(ix, iz));
+        }
+    }
+}
 
-            let v = ((h >> 4) & 0xff) as f32 / 255.0;
-            let top = [0.28 + 0.12 * v, 0.62 + 0.10 * v, 0.14 + 0.06 * v];
-            let bot = [0.10, 0.30, 0.08];
-            let cy = gy + th + 0.6 * s;
-            let seed = (h & 0x7fff) as i32;
-            push_blob(out, Vec3::new(x, cy, z), Vec3::new(3.4 * s, 1.7 * s, 3.4 * s), top, bot, seed, 6, 3, 0.22);
-            push_blob(out, Vec3::new(x + 1.9 * s, cy + 1.0 * s, z - 1.0 * s), Vec3::new(2.5 * s, 1.3 * s, 2.5 * s), top, bot, seed + 5, 6, 3, 0.22);
-            push_blob(out, Vec3::new(x - 1.7 * s, cy + 1.2 * s, z + 1.3 * s), Vec3::new(2.3 * s, 1.2 * s, 2.3 * s), top, bot, seed + 9, 6, 3, 0.22);
+const SUN: [f32; 3] = [0.45, 0.80, 0.40];
+
+fn sun_dir() -> Vec3 {
+    Vec3::new(SUN[0], SUN[1], SUN[2]).normalize()
+}
+
+/// Tapered, smooth-shaded branch / trunk segment.
+fn push_limb(out: &mut Vec<Vertex>, a: Vec3, b: Vec3, ra: f32, rb: f32, ca: [f32; 3], cb: [f32; 3], sides: usize) {
+    use std::f32::consts::TAU;
+    let axis = b - a;
+    let len = axis.length();
+    if len < 1e-4 {
+        return;
+    }
+    let dir = axis / len;
+    let helper = if dir.y.abs() < 0.95 { Vec3::Y } else { Vec3::new(1.0, 0.0, 0.0) };
+    let u = dir.cross(helper).normalize();
+    let v = dir.cross(u);
+    let sun = sun_dir();
+    let mut ring_a: Vec<(Vec3, [f32; 3])> = Vec::with_capacity(sides);
+    let mut ring_b: Vec<(Vec3, [f32; 3])> = Vec::with_capacity(sides);
+    for i in 0..sides {
+        let th = TAU * i as f32 / sides as f32;
+        let off = u * th.cos() + v * th.sin();
+        let lit = 0.50 + 0.65 * off.dot(sun).max(0.0);
+        ring_a.push((a + off * ra, scale(ca, lit)));
+        ring_b.push((b + off * rb, scale(cb, lit)));
+    }
+    for i in 0..sides {
+        let j = (i + 1) % sides;
+        let (a0, a1, b0, b1) = (ring_a[i], ring_a[j], ring_b[i], ring_b[j]);
+        for &(p, c) in &[a0, a1, b1, a0, b1, b0] {
+            out.push(Vertex { pos: p.to_array(), color: c, kind: 1.0 });
+        }
+    }
+}
+
+/// Soft, lumpy, smooth-shaded leaf cluster (ellipsoid with noise, light on top, dark underneath).
+fn push_canopy(
+    out: &mut Vec<Vertex>,
+    c: Vec3,
+    r: Vec3,
+    top: [f32; 3],
+    bot: [f32; 3],
+    seed: i32,
+    segs: usize,
+    rings: usize,
+    jit: f32,
+) {
+    use std::f32::consts::{FRAC_PI_2, PI, TAU};
+    let sun = sun_dir();
+    let mut pts: Vec<Vec3> = Vec::with_capacity((rings + 1) * segs);
+    let mut cols: Vec<[f32; 3]> = Vec::with_capacity((rings + 1) * segs);
+    for k in 0..=rings {
+        let phi = -FRAC_PI_2 + PI * k as f32 / rings as f32;
+        let (sp, cp) = phi.sin_cos();
+        for i in 0..segs {
+            let th = TAU * i as f32 / segs as f32;
+            let pole = k == 0 || k == rings;
+            let j = if pole { 1.0 } else { 1.0 + jit * (h01(seed + k as i32 * 13, i as i32 * 7 + seed) - 0.5) * 2.0 };
+            let p = Vec3::new(
+                c.x + r.x * cp * th.cos() * j,
+                c.y + r.y * sp * j,
+                c.z + r.z * cp * th.sin() * j,
+            );
+            let d = p - c;
+            let n = Vec3::new(d.x / (r.x * r.x), d.y / (r.y * r.y), d.z / (r.z * r.z));
+            let nl = n.length();
+            let n = if nl > 1e-6 { n / nl } else { Vec3::Y };
+            let up = ((d.y / r.y) * 0.5 + 0.5).clamp(0.0, 1.0);
+            let lit = (0.66 + 0.52 * n.dot(sun).max(0.0)).min(1.2);
+            let mott = 0.95 + 0.10 * h01(seed * 31 + (k * 17 + i) as i32, 5);
+            let base = mix(bot, top, up * up * 0.5 + up * 0.5);
+            cols.push(scale(base, lit * mott));
+            pts.push(p);
+        }
+    }
+    let idx = |k: usize, i: usize| k * segs + (i % segs);
+    let mut tri = |out: &mut Vec<Vertex>, a: usize, b: usize, d: usize| {
+        for &q in &[a, b, d] {
+            out.push(Vertex { pos: pts[q].to_array(), color: cols[q], kind: 1.0 });
+        }
+    };
+    for k in 0..rings {
+        for i in 0..segs {
+            let a = idx(k, i);
+            let b = idx(k, i + 1);
+            let cc = idx(k + 1, i + 1);
+            let d = idx(k + 1, i);
+            if k == 0 {
+                tri(out, a, cc, d);
+            } else if k == rings - 1 {
+                tri(out, a, b, d);
+            } else {
+                tri(out, a, b, cc);
+                tri(out, a, cc, d);
+            }
+        }
+    }
+}
+
+/// Three kinds of tree: broadleaf (oak-like), umbrella pine and tall cypress.
+fn push_tree(out: &mut Vec<Vertex>, x: f32, gy: f32, z: f32, s: f32, h: u32) {
+    use std::f32::consts::TAU;
+    let hs = (h & 0xffff) as i32;
+    let rnd = |k: i32| (hash(hs, k) & 0xff) as f32 / 255.0;
+    let kind = hash(hs, 99) % 20;
+    let ang = rnd(1) * TAU;
+    let g = rnd(2);
+    let bark_lo = [0.20, 0.13, 0.10];
+    let bark_hi = [0.36, 0.26, 0.19];
+    let base = Vec3::new(x, gy - 0.6, z);
+    let seed = hs;
+
+    if kind < 11 {
+        // ---- broadleaf ----
+        let top = [0.42 + 0.16 * g, 0.74 + 0.10 * g, 0.20 + 0.07 * g];
+        let bot = [0.16, 0.40, 0.12];
+        let hh = 9.5 * s;
+        let lean = (ang.cos() * 0.7 * s, ang.sin() * 0.7 * s);
+        let flare = base + Vec3::new(0.0, 1.5, 0.0);
+        push_limb(out, base, flare, 0.72 * s, 0.46 * s, bark_lo, bark_lo, 7);
+        let fork = Vec3::new(x + lean.0, gy + hh * 0.42, z + lean.1);
+        push_limb(out, flare, fork, 0.46 * s, 0.32 * s, bark_lo, bark_hi, 7);
+        let nb = if rnd(3) > 0.5 { 4 } else { 3 };
+        for k in 0..nb {
+            let a = ang + k as f32 * TAU / nb as f32 + rnd(10 + k) * 0.7;
+            let len = (2.6 + 1.4 * rnd(20 + k)) * s;
+            let end = fork + Vec3::new(a.cos() * len, hh * (0.26 + 0.1 * rnd(30 + k)), a.sin() * len);
+            push_limb(out, fork, end, 0.27 * s, 0.09 * s, bark_hi, bark_hi, 6);
+            let rr = (2.9 + 0.8 * rnd(40 + k)) * s;
+            push_canopy(out, end + Vec3::new(0.0, 1.1 * s, 0.0), Vec3::new(rr, 2.2 * s, rr), top, bot, seed + k * 3, 10, 5, 0.18);
+        }
+        let crown = Vec3::new(fork.x, gy + hh * 0.86, fork.z);
+        push_canopy(out, crown, Vec3::new(3.7 * s, 2.7 * s, 3.7 * s), top, bot, seed + 50, 10, 5, 0.16);
+        push_canopy(
+            out,
+            crown + Vec3::new(0.9 * s, 1.9 * s, -0.7 * s),
+            Vec3::new(2.4 * s, 1.8 * s, 2.4 * s),
+            top,
+            bot,
+            seed + 60,
+            10,
+            5,
+            0.14,
+        );
+    } else if kind < 17 {
+        // ---- umbrella pine (tall bare trunk, flat wide crown) ----
+        let top = [0.30 + 0.10 * g, 0.62 + 0.08 * g, 0.24 + 0.05 * g];
+        let bot = [0.12, 0.34, 0.14];
+        let hh = 12.5 * s;
+        let l1 = (ang.cos() * 0.9 * s, ang.sin() * 0.9 * s);
+        let l2 = (ang.cos() * 1.9 * s, ang.sin() * 1.9 * s);
+        let mid = Vec3::new(x + l1.0, gy + hh * 0.55, z + l1.1);
+        let tip = Vec3::new(x + l2.0, gy + hh * 0.84, z + l2.1);
+        push_limb(out, base, mid, 0.46 * s, 0.30 * s, bark_lo, bark_hi, 7);
+        push_limb(out, mid, tip, 0.30 * s, 0.17 * s, bark_hi, bark_hi, 6);
+        for k in 0..2 {
+            let a = ang + 1.6 + k as f32 * 3.1 + rnd(11 + k) * 0.5;
+            let end = Vec3::new(tip.x + a.cos() * 3.4 * s, tip.y - 0.5 * s, tip.z + a.sin() * 3.4 * s);
+            push_limb(out, Vec3::new(tip.x, tip.y - 1.6 * s, tip.z), end, 0.16 * s, 0.07 * s, bark_hi, bark_hi, 5);
+            push_canopy(out, end + Vec3::new(0.0, 0.8 * s, 0.0), Vec3::new(3.6 * s, 1.2 * s, 3.6 * s), top, bot, seed + k * 7, 10, 5, 0.14);
+        }
+        push_canopy(out, tip + Vec3::new(0.0, 1.0 * s, 0.0), Vec3::new(5.0 * s, 1.6 * s, 5.0 * s), top, bot, seed + 70, 10, 5, 0.14);
+        push_canopy(out, tip + Vec3::new(-1.2 * s, 2.0 * s, 0.8 * s), Vec3::new(3.0 * s, 1.4 * s, 3.0 * s), top, bot, seed + 80, 10, 5, 0.14);
+    } else {
+        // ---- cypress (tall narrow flame) ----
+        let top = [0.18 + 0.06 * g, 0.52 + 0.06 * g, 0.24];
+        let bot = [0.07, 0.24, 0.11];
+        let tops: [(f32, f32); 4] = [(1.9, 3.0), (1.7, 2.9), (1.4, 2.7), (1.0, 2.4)];
+        push_limb(out, base, base + Vec3::new(0.0, 3.2 * s, 0.0), 0.34 * s, 0.22 * s, bark_lo, bark_lo, 6);
+        for (i, &(rx, ry)) in tops.iter().enumerate() {
+            let c = Vec3::new(x, gy + (2.8 + i as f32 * 2.7) * s, z);
+            push_canopy(out, c, Vec3::new(rx * s, ry * s, rx * s), top, bot, seed + i as i32 * 11, 10, 5, 0.12);
         }
     }
 }
@@ -725,15 +913,15 @@ impl Game {
 
     /// Hot-air balloons drifting in the sky (a few hundred vertices, rebuilt each frame).
     pub fn build_balloons(&self, out: &mut Vec<Vertex>) {
-        const SPACING: f32 = 380.0;
+        const SPACING: f32 = 260.0;
         let t0 = ((self.pos.z - 450.0) / SPACING).floor() as i32;
         let t1 = ((self.pos.z + 450.0) / SPACING).floor() as i32;
         for t in t0..=t1 {
             let hh = hash(t, 777);
-            let bz = t as f32 * SPACING + (hh % 300) as f32;
+            let bz = t as f32 * SPACING + (hh % 200) as f32;
             let sgn = if hh & 0x100 != 0 { 1.0 } else { -1.0 };
-            let bx = road_x(bz) + sgn * (70.0 + ((hh >> 12) & 63) as f32);
-            let by = 62.0 + ((hh >> 20) & 15) as f32;
+            let bx = road_x(bz) + sgn * (55.0 + ((hh >> 12) & 31) as f32);
+            let by = 105.0 + ((hh >> 20) & 15) as f32;
             push_blob(
                 out,
                 Vec3::new(bx, by, bz),

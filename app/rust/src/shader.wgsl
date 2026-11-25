@@ -1,7 +1,7 @@
 struct U {
     vp: mat4x4<f32>,
     fog: vec4<f32>,     // rgb = fog / horizon colour
-    params: vec4<f32>,  // x = fog density
+    params: vec4<f32>,  // x = fog density, y = chunk hidden amount (1 = just spawned, 0 = settled)
 };
 @group(0) @binding(0) var<uniform> u: U;
 
@@ -16,7 +16,8 @@ struct VOut {
 @vertex
 fn vs_main(@location(0) p: vec3<f32>, @location(1) c: vec3<f32>, @location(2) k: f32) -> VOut {
     var o: VOut;
-    o.pos = u.vp * vec4<f32>(p, 1.0);
+    let q = vec3<f32>(p.x, p.y - u.params.y * 28.0, p.z);
+    o.pos = u.vp * vec4<f32>(q, 1.0);
     o.color = c;
     o.world = p;
     o.kind = k;
@@ -36,7 +37,8 @@ fn fs_main(i: VOut) -> @location(0) vec4<f32> {
     }
     let t = i.dist * u.params.x;
     let f = 1.0 - exp(-t * t);
-    return vec4<f32>(mix(col, u.fog.rgb, f), 1.0);
+    let g = max(f, u.params.y);
+    return vec4<f32>(mix(col, u.fog.rgb, g), 1.0);
 }
 
 // ---- sky: fullscreen gradient ----

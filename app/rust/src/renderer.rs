@@ -30,7 +30,12 @@ struct Uniforms {
 struct Chunk {
     vb: wgpu::Buffer,
     count: u32,
+    born: Instant,
+    /// Own uniforms while the spawn animation runs (None once settled).
+    anim: Option<(wgpu::Buffer, wgpu::BindGroup)>,
 }
+
+const REVEAL_SECS: f32 = 1.4;
 
 pub struct Renderer {
     surface: wgpu::Surface<'static>,
@@ -53,6 +58,7 @@ pub struct Renderer {
     part: Vec<Vertex>,
     hud_cache: Vec<Vertex>,
     hud_key: (u32, u32),
+    bgl: wgpu::BindGroupLayout,
 }
 
 fn make_depth(device: &wgpu::Device, w: u32, h: u32) -> wgpu::TextureView {
@@ -273,6 +279,7 @@ impl Renderer {
             part: Vec::with_capacity(8_000),
             hud_cache: Vec::new(),
             hud_key: (u32::MAX, 0),
+            bgl,
         }
     }
 
@@ -313,6 +320,7 @@ impl Renderer {
         } else {
             Duration::from_millis(3)
         };
+        let first = self.chunks.is_empty();
         let t0 = Instant::now();
         let mut built = 0;
         for (_, key) in missing {
@@ -330,7 +338,23 @@ impl Renderer {
                 contents: bytemuck::cast_slice(&self.part),
                 usage: wgpu::BufferUsages::VERTEX,
             });
-            self.chunks.insert(key, Chunk { vb, count: self.part.len() as u32 });
+            let anim = if first {
+                None // initial load appears instantly
+            } else {
+                let ub = self.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("chunk_ub"),
+                    size: std::mem::size_of::<Uniforms>() as u64,
+                    usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+                let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: None,
+                    layout: &self.bgl,
+                    entries: &[wgpu::BindGroupEntry { binding: 0, resource: ub.as_entire_binding() }],
+                });
+                Some((ub, bg))
+            };
+            self.chunks.insert(key, Chunk { vb, count: self.part.len() as u32, born: Instant::now(), anim });
         }
     }
 
@@ -365,6 +389,29 @@ impl Renderer {
 
         // ---- static world: built once per chunk, cached on the GPU ----
         self.stream_chunks(g);
+
+        // spawn animation: new chunks rise out of the fog with an ease-out curve
+        let world_u = Uniforms {
+            vp: (proj * view).to_cols_array_2d(),
+            fog: FOG,
+            params: [1.0 / 240.0, 0.0, 0.0, 0.0],
+        };
+        for c in self.chunks.values_mut() {
+            if c.anim.is_none() {
+                continue;
+            }
+            let t = (c.born.elapsed().as_secs_f32() / REVEAL_SECS).min(1.0);
+            if t >= 1.0 {
+                c.anim = None;
+                continue;
+            }
+            let e = 1.0 - (1.0 - t) * (1.0 - t) * (1.0 - t);
+            let mut u = world_u;
+            u.params[1] = 1.0 - e;
+            if let Some((ub, _)) = &c.anim {
+                self.queue.write_buffer(ub, 0, bytemuck::bytes_of(&u));
+            }
+        }
 
         // ---- small dynamic batch: balloons + cockpit + HUD (one upload) ----
         self.batch.clear();
@@ -453,10 +500,15 @@ impl Renderer {
             pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, &self.world_bg, &[]);
             for c in visible.iter() {
+                match &c.anim {
+                    Some((_, bg)) => pass.set_bind_group(0, bg, &[]),
+                    None => pass.set_bind_group(0, &self.world_bg, &[]),
+                }
                 pass.set_vertex_buffer(0, c.vb.slice(..));
                 pass.draw(0..c.count, 0..1);
             }
 
+            pass.set_bind_group(0, &self.world_bg, &[]);
             pass.set_vertex_buffer(0, self.dyn_vb.slice(..));
             if n_balloon > 0 {
                 pass.draw(0..n_balloon, 0..1);

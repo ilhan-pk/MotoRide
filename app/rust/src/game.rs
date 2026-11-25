@@ -136,6 +136,29 @@ pub fn terrain_h(x: f32, z: f32) -> f32 {
     nat + (road_target(zr) - nat) * w
 }
 
+/// Perpendicular distance to the road centre line (accurate, via the nearest road point).
+fn road_off(x: f32, z: f32) -> f32 {
+    if (x - road_x(z)).abs() >= 90.0 {
+        return 99.0;
+    }
+    let zr = road_param(x, z);
+    let dx = x - road_x(zr);
+    let dz = z - zr;
+    (dx * dx + dz * dz).sqrt()
+}
+
+fn smooth(e0: f32, e1: f32, v: f32) -> f32 {
+    let t = ((v - e0) / (e1 - e0)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+/// Visual terrain height: like `terrain_h`, but sunk under the road bed so the coarse 10 m grass mesh
+/// can never poke through the asphalt / sand (the physics ground stays `terrain_h`).
+fn mesh_h(x: f32, z: f32) -> f32 {
+    let d = road_off(x, z);
+    terrain_h(x, z) - 0.45 * (1.0 - smooth(8.0, 17.0, d))
+}
+
 fn grad(x: f32, z: f32) -> (f32, f32) {
     let e = 1.5;
     (
@@ -238,6 +261,7 @@ pub fn build_chunk(cx: i32, cz: i32, out: &mut Vec<Vertex>) {
     build_terrain(x0, z0, out);
     build_ribbon(x0, z0, out);
     build_props(x0, z0, out);
+    build_flowers(cx, cz, out);
     if TREES {
         build_trees(cx, cz, out);
     }
@@ -249,7 +273,7 @@ fn build_terrain(x0: f32, z0: f32, out: &mut Vec<Vertex>) {
     let mut hs = vec![0f32; m * m];
     for j in 0..m {
         for i in 0..m {
-            hs[j * m + i] = terrain_h(x0 + (i as f32 - 1.0) * CELL, z0 + (j as f32 - 1.0) * CELL);
+            hs[j * m + i] = mesh_h(x0 + (i as f32 - 1.0) * CELL, z0 + (j as f32 - 1.0) * CELL);
         }
     }
     let h = |i: i32, j: i32| hs[((j + 1) as usize) * m + (i + 1) as usize];
@@ -266,7 +290,10 @@ fn build_terrain(x0: f32, z0: f32, out: &mut Vec<Vertex>) {
             let slope = ((hl - hr) * (hl - hr) + (hd - hu) * (hd - hu)).sqrt() / (2.0 * CELL);
             let x = x0 + i as f32 * CELL;
             let z = z0 + j as f32 * CELL;
-            let base = terrain_color(x, z, slope);
+            let mut base = terrain_color(x, z, slope);
+            // dusty verge under / next to the road, so no bright green ever shows on the asphalt
+            let dust = 0.75 * (1.0 - smooth(4.5, 11.0, road_off(x, z)));
+            base = mix(base, [0.62, 0.62, 0.52], dust);
             let shade = (0.66 + 0.42 * nrm.dot(sun).max(0.0)).min(1.1);
             verts.push(Vertex {
                 pos: [x, h(i, j), z],
@@ -436,6 +463,82 @@ fn build_props(x0: f32, z0: f32, out: &mut Vec<Vertex>) {
         push_box(out, m, Vec3::new(0.0, 1.0, 0.0), Vec3::new(0.05, 1.0, 0.05), [0.40, 0.44, 0.48]);
         push_box(out, m, Vec3::new(0.0, 2.1, 0.0), Vec3::new(0.55, 0.55, 0.04), [0.96, 0.96, 0.96]);
         push_box(out, m, Vec3::new(0.0, 2.1, 0.05), Vec3::new(0.38, 0.38, 0.03), [0.85, 0.10, 0.10]);
+    }
+}
+
+
+const FLOWER_COLORS: [[f32; 3]; 7] = [
+    [0.95, 0.15, 0.20], // red
+    [1.00, 0.85, 0.12], // yellow
+    [0.98, 0.98, 0.96], // white
+    [1.00, 0.45, 0.70], // pink
+    [0.62, 0.30, 0.90], // purple
+    [1.00, 0.55, 0.10], // orange
+    [0.30, 0.50, 1.00], // blue
+];
+const FL_CELL: f32 = 8.0;
+const FL_PER_CLUSTER: u32 = 6;
+
+/// Wild-flower patches on both sides of the road: tilted little blooms facing the rider.
+fn build_flowers(cx: i32, cz: i32, out: &mut Vec<Vertex>) {
+    let n = (CHUNK / FL_CELL) as i32;
+    for ix in cx * n..cx * n + n {
+        for iz in cz * n..cz * n + n {
+            let h = hash(ix * 13 + 5, iz * 17 + 9);
+            let px = (ix as f32 + 0.15 + 0.7 * ((h >> 8) & 0xff) as f32 / 255.0) * FL_CELL;
+            let pz = (iz as f32 + 0.15 + 0.7 * ((h >> 16) & 0xff) as f32 / 255.0) * FL_CELL;
+            let d = road_off(px, pz);
+            if d < 9.0 || d > 70.0 {
+                continue;
+            }
+            // patchy meadows: more flowers near the road, in noise-driven patches
+            let patch = vnoise(px / 55.0 + 5.1, pz / 55.0 - 2.7);
+            let p = if d < 26.0 { 0.62 } else { 0.28 } * (0.4 + patch);
+            if ((h & 0xff) as f32 / 255.0) > p {
+                continue;
+            }
+            // skip clusters that would sit inside a tree trunk
+            let col = FLOWER_COLORS[((h >> 24) % 7) as usize];
+            let col2 = FLOWER_COLORS[((h >> 27) % 7) as usize];
+            // direction towards the road (horizontal)
+            let rx = road_x(road_param(px, pz));
+            let to = Vec3::new(if rx > px { 1.0 } else { -1.0 }, 0.0, 0.0);
+            for k in 0..FL_PER_CLUSTER {
+                let hk = hash(ix * 31 + k as i32 * 7, iz * 37 + 3);
+                let a = ((hk & 0xff) as f32 / 255.0) * std::f32::consts::TAU;
+                let rr = 0.3 + 1.9 * (((hk >> 8) & 0xff) as f32 / 255.0);
+                let x = px + a.cos() * rr;
+                let z = pz + a.sin() * rr;
+                let gy = terrain_h(x, z);
+                let hh = 0.32 + 0.30 * (((hk >> 16) & 0xff) as f32 / 255.0);
+                let r = 0.10 + 0.07 * (((hk >> 24) & 0xff) as f32 / 255.0);
+                let petal = if hk & 0x100 != 0 { col } else { col2 };
+                let top = Vec3::new(x, gy + hh, z);
+                // stem
+                let sg = [0.20, 0.52, 0.16];
+                for &(p, c) in &[
+                    ([x - 0.015, gy, z], sg),
+                    ([x + 0.015, gy, z], sg),
+                    ([top.x, top.y, top.z], [0.30, 0.62, 0.20]),
+                ] {
+                    out.push(Vertex { pos: p, color: c, kind: 1.0 });
+                }
+                // bloom: tilted fan, yellow centre -> coloured petals
+                let nrm = (to * 0.8 + Vec3::Y * 0.6).normalize();
+                let t1 = Vec3::Y.cross(nrm).normalize();
+                let t2 = nrm.cross(t1);
+                let ring = |i: u32| -> [f32; 3] {
+                    let an = std::f32::consts::TAU * i as f32 / 5.0;
+                    let q = top + (t1 * an.cos() + t2 * an.sin()) * r;
+                    [q.x, q.y, q.z]
+                };
+                for i in 0..5u32 {
+                    out.push(Vertex { pos: [top.x, top.y, top.z], color: [1.0, 0.86, 0.20], kind: 1.0 });
+                    out.push(Vertex { pos: ring(i), color: petal, kind: 1.0 });
+                    out.push(Vertex { pos: ring(i + 1), color: petal, kind: 1.0 });
+                }
+            }
+        }
     }
 }
 

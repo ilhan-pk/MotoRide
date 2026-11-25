@@ -1,16 +1,21 @@
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use glam::{Mat4, Vec3};
+use wgpu::util::{BufferInitDescriptor, DeviceExt};
 use winit::window::Window;
 
-use crate::game::{Game, Vertex};
+use crate::game::{build_chunk, Game, Vertex, CHUNK};
 use crate::hud;
 
-const MAX_WORLD_VERTS: usize = 60_000; // multiple of 3
+const MAX_BALLOON_VERTS: usize = 3_000;
 const MAX_COCKPIT_VERTS: usize = 600;
 const MAX_HUD_VERTS: usize = 600;
-const MAX_VERTS: usize = MAX_WORLD_VERTS + MAX_COCKPIT_VERTS + MAX_HUD_VERTS;
-const FOG: [f32; 4] = [0.66, 0.72, 0.82, 1.0];
+const MAX_DYN_VERTS: usize = MAX_BALLOON_VERTS + MAX_COCKPIT_VERTS + MAX_HUD_VERTS;
+/// Chunks kept around the player (each side). 4 -> 9 x 9 chunks = 720 m square.
+const R_CHUNKS: i32 = 4;
+const FOG: [f32; 4] = [0.72, 0.96, 0.99, 1.0];
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 
 #[repr(C)]
@@ -19,6 +24,12 @@ struct Uniforms {
     vp: [[f32; 4]; 4],
     fog: [f32; 4],
     params: [f32; 4],
+}
+
+/// A static piece of world, built once and kept on the GPU.
+struct Chunk {
+    vb: wgpu::Buffer,
+    count: u32,
 }
 
 pub struct Renderer {
@@ -34,11 +45,14 @@ pub struct Renderer {
     world_bg: wgpu::BindGroup,
     cockpit_bg: wgpu::BindGroup,
     hud_bg: wgpu::BindGroup,
-    /// One shared vertex buffer: [world | cockpit | hud], uploaded once per frame.
-    vb: wgpu::Buffer,
+    /// Small per-frame buffer: [balloons | cockpit | hud].
+    dyn_vb: wgpu::Buffer,
+    chunks: HashMap<(i32, i32), Chunk>,
     depth_view: wgpu::TextureView,
     batch: Vec<Vertex>,
     part: Vec<Vertex>,
+    hud_cache: Vec<Vertex>,
+    hud_key: (u32, u32),
 }
 
 fn make_depth(device: &wgpu::Device, w: u32, h: u32) -> wgpu::TextureView {
@@ -162,9 +176,9 @@ impl Renderer {
         let hud_bg = make_bg(&hud_ub);
 
         let vsize = std::mem::size_of::<Vertex>() as u64;
-        let vb = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("batch_vb"),
-            size: vsize * MAX_VERTS as u64,
+        let dyn_vb = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("dyn_vb"),
+            size: vsize * MAX_DYN_VERTS as u64,
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -252,10 +266,13 @@ impl Renderer {
             world_bg,
             cockpit_bg,
             hud_bg,
-            vb,
+            dyn_vb,
+            chunks: HashMap::new(),
             depth_view,
-            batch: Vec::with_capacity(MAX_VERTS),
-            part: Vec::with_capacity(MAX_WORLD_VERTS),
+            batch: Vec::with_capacity(MAX_DYN_VERTS),
+            part: Vec::with_capacity(8_000),
+            hud_cache: Vec::new(),
+            hud_key: (u32::MAX, 0),
         }
     }
 
@@ -269,6 +286,54 @@ impl Renderer {
         self.depth_view = make_depth(&self.device, w, h);
     }
 
+    /// Build missing chunks around the player (a few ms per frame at most) and drop far ones.
+    fn stream_chunks(&mut self, g: &Game) {
+        let pcx = (g.pos.x / CHUNK).floor() as i32;
+        let pcz = (g.pos.z / CHUNK).floor() as i32;
+        self.chunks
+            .retain(|k, _| (k.0 - pcx).abs() <= R_CHUNKS + 1 && (k.1 - pcz).abs() <= R_CHUNKS + 1);
+
+        let mut missing: Vec<(i32, (i32, i32))> = Vec::new();
+        for dz in -R_CHUNKS..=R_CHUNKS {
+            for dx in -R_CHUNKS..=R_CHUNKS {
+                let key = (pcx + dx, pcz + dz);
+                if !self.chunks.contains_key(&key) {
+                    missing.push((dx * dx + dz * dz, key));
+                }
+            }
+        }
+        if missing.is_empty() {
+            return;
+        }
+        missing.sort_by_key(|m| m.0); // nearest first
+
+        // First frame: build everything at once. Afterwards: a small time budget per frame.
+        let budget = if self.chunks.is_empty() {
+            Duration::from_millis(1500)
+        } else {
+            Duration::from_millis(3)
+        };
+        let t0 = Instant::now();
+        let mut built = 0;
+        for (_, key) in missing {
+            if built > 0 && t0.elapsed() > budget {
+                break;
+            }
+            self.part.clear();
+            build_chunk(key.0, key.1, &mut self.part);
+            built += 1;
+            if self.part.is_empty() {
+                continue;
+            }
+            let vb = self.device.create_buffer_init(&BufferInitDescriptor {
+                label: Some("chunk"),
+                contents: bytemuck::cast_slice(&self.part),
+                usage: wgpu::BufferUsages::VERTEX,
+            });
+            self.chunks.insert(key, Chunk { vb, count: self.part.len() as u32 });
+        }
+    }
+
     pub fn render(&mut self, g: &Game, fps: u32) {
         let aspect = self.config.width as f32 / self.config.height as f32;
         let proj = Mat4::perspective_rh(70f32.to_radians(), aspect, 0.3, 2000.0);
@@ -280,7 +345,7 @@ impl Renderer {
             bytemuck::bytes_of(&Uniforms {
                 vp: (proj * view).to_cols_array_2d(),
                 fog: FOG,
-                params: [1.0 / 210.0, 0.0, 0.0, 0.0],
+                params: [1.0 / 240.0, 0.0, 0.0, 0.0],
             }),
         );
         self.queue.write_buffer(
@@ -298,13 +363,16 @@ impl Renderer {
             }),
         );
 
-        // ---- batch all geometry into one buffer, one upload ----
+        // ---- static world: built once per chunk, cached on the GPU ----
+        self.stream_chunks(g);
+
+        // ---- small dynamic batch: balloons + cockpit + HUD (one upload) ----
         self.batch.clear();
 
         self.part.clear();
-        g.build_world(&mut self.part);
-        self.part.truncate(MAX_WORLD_VERTS);
-        let n_world = self.part.len() as u32;
+        g.build_balloons(&mut self.part);
+        self.part.truncate(MAX_BALLOON_VERTS - MAX_BALLOON_VERTS % 3);
+        let n_balloon = self.part.len() as u32;
         self.batch.extend_from_slice(&self.part);
 
         self.part.clear();
@@ -313,16 +381,38 @@ impl Renderer {
         let n_cockpit = self.part.len() as u32;
         self.batch.extend_from_slice(&self.part);
 
-        self.part.clear();
-        hud::build_fps(&mut self.part, fps, aspect);
-        self.part.truncate(MAX_HUD_VERTS);
-        let n_hud = self.part.len() as u32;
-        self.batch.extend_from_slice(&self.part);
+        // The FPS text only changes a couple of times per second: rebuild it only then.
+        let aspect_key = (aspect * 1000.0) as u32;
+        if self.hud_key != (fps, aspect_key) {
+            self.hud_cache.clear();
+            hud::build_fps(&mut self.hud_cache, fps, aspect);
+            self.hud_cache.truncate(MAX_HUD_VERTS);
+            self.hud_key = (fps, aspect_key);
+        }
+        let n_hud = self.hud_cache.len() as u32;
+        self.batch.extend_from_slice(&self.hud_cache);
 
-        self.queue.write_buffer(&self.vb, 0, bytemuck::cast_slice(&self.batch));
+        self.queue.write_buffer(&self.dyn_vb, 0, bytemuck::cast_slice(&self.batch));
 
-        let cockpit_start = n_world;
-        let hud_start = n_world + n_cockpit;
+        let cockpit_start = n_balloon;
+        let hud_start = n_balloon + n_cockpit;
+
+        // ---- cull chunks that are behind or far to the side ----
+        let eye = g.eye();
+        let f = g.forward();
+        let tan_h = 35f32.to_radians().tan() * aspect;
+        let mut visible: Vec<&Chunk> = Vec::with_capacity(48);
+        for (key, chunk) in self.chunks.iter() {
+            let cx = (key.0 as f32 + 0.5) * CHUNK - eye.x;
+            let cz = (key.1 as f32 + 0.5) * CHUNK - eye.z;
+            let dist = (cx * cx + cz * cz).sqrt();
+            let along = cx * f.x + cz * f.z;
+            let perp = (cx * f.z - cz * f.x).abs();
+            let near = dist < CHUNK * 1.3;
+            if near || (along > -CHUNK * 0.9 && perp < along.max(0.0) * tan_h * 1.15 + CHUNK * 1.2) {
+                visible.push(chunk);
+            }
+        }
 
         let frame = match self.surface.get_current_texture() {
             Ok(f) => f,
@@ -340,7 +430,7 @@ impl Renderer {
                     view: &view_tex,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.66, g: 0.72, b: 0.82, a: 1.0 }),
+                        load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.72, g: 0.96, b: 0.99, a: 1.0 }),
                         store: wgpu::StoreOp::Store,
                     },
                 })],
@@ -361,16 +451,24 @@ impl Renderer {
             pass.draw(0..3, 0..1);
 
             pass.set_pipeline(&self.pipeline);
-            pass.set_vertex_buffer(0, self.vb.slice(..));
-
             pass.set_bind_group(0, &self.world_bg, &[]);
-            pass.draw(0..n_world, 0..1);
+            for c in visible.iter() {
+                pass.set_vertex_buffer(0, c.vb.slice(..));
+                pass.draw(0..c.count, 0..1);
+            }
+
+            pass.set_vertex_buffer(0, self.dyn_vb.slice(..));
+            if n_balloon > 0 {
+                pass.draw(0..n_balloon, 0..1);
+            }
 
             pass.set_bind_group(0, &self.cockpit_bg, &[]);
             pass.draw(cockpit_start..cockpit_start + n_cockpit, 0..1);
 
-            pass.set_bind_group(0, &self.hud_bg, &[]);
-            pass.draw(hud_start..hud_start + n_hud, 0..1);
+            if n_hud > 0 {
+                pass.set_bind_group(0, &self.hud_bg, &[]);
+                pass.draw(hud_start..hud_start + n_hud, 0..1);
+            }
         }
         self.queue.submit(Some(enc.finish()));
         frame.present();

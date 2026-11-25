@@ -60,7 +60,7 @@ fn vs_sky(@builtin(vertex_index) idx: u32) -> SkyOut {
 
 @fragment
 fn fs_sky(i: SkyOut) -> @location(0) vec4<f32> {
-    let top = vec3<f32>(0.36, 0.50, 0.74);
+    let top = vec3<f32>(0.50, 0.90, 1.0);
     let k = smoothstep(0.5, 1.0, clamp(i.uv.y, 0.0, 1.0));
     return vec4<f32>(mix(u.fog.rgb, top, k), 1.0);
 }

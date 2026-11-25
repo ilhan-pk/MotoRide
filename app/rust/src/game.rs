@@ -11,16 +11,22 @@ pub struct Vertex {
 }
 
 pub const MAX_SPEED: f32 = 48.0; // m/s (~173 km/h)
+/// World is built and cached in square chunks of this size (m).
+pub const CHUNK: f32 = 80.0;
 
 const G: f32 = 12.0;
-const CELL: f32 = 8.0; // terrain grid cell (m)
-const N: i32 = 80; // terrain cells per side -> +-320 m view
-const WATER_Y: f32 = -7.5;
-const ROAD_HALF: f32 = 3.0;
-const WALL_OFF: f32 = 4.6;
-const SEG: f32 = 4.0; // road ribbon step (m)
-const BLOCK: f32 = 6.0; // stone wall block length (m)
-const VIEW: f32 = 300.0; // road / wall draw distance each way (m)
+const CELL: f32 = 10.0; // terrain grid cell (m)
+const CPC: i32 = 8; // cells per chunk side (CHUNK / CELL)
+const TREE_CELL: f32 = 16.0;
+const TPC: i32 = 5; // tree cells per chunk side (CHUNK / TREE_CELL)
+const ROAD_HALF: f32 = 5.5;
+const RAIL_OFF: f32 = 12.0;
+const SEG: f32 = 3.0; // road ribbon step (m)
+const BLOCK: f32 = 6.0; // guard-rail block length (m)
+const LAMP: f32 = 48.0;
+const SIGN: f32 = 24.0;
+/// Set to false to remove all trees.
+const TREES: bool = true;
 
 #[derive(Default)]
 pub struct Input {
@@ -65,59 +71,53 @@ fn vnoise(x: f32, z: f32) -> f32 {
     top + (bot - top) * v
 }
 
-/// Rolling hills.
+/// Gentle rolling ground.
 fn natural(x: f32, z: f32) -> f32 {
     let n = vnoise(x / 300.0, z / 300.0) * 0.66
         + vnoise(x / 110.0 + 17.3, z / 110.0 - 9.1) * 0.27
         + vnoise(x / 60.0 - 3.7, z / 60.0 + 5.2) * 0.07;
-    (n - 0.5) * 42.0
+    (n - 0.5) * 20.0
 }
 
-/// The rally road winds along the z axis forever.
-fn road_x(z: f32) -> f32 {
-    45.0 * (z / 200.0).sin() + 22.0 * (z / 85.0 + 1.3).sin() + 5.0 * (z / 37.0).sin()
+/// The race track winds along the z axis forever (S-bends).
+pub fn road_x(z: f32) -> f32 {
+    40.0 * (z / 150.0).sin() + 16.0 * (z / 62.0 + 1.3).sin() + 4.0 * (z / 31.0).sin()
 }
 
-/// d(road_x)/dz
-fn road_dx(z: f32) -> f32 {
-    45.0 / 200.0 * (z / 200.0).cos() + 22.0 / 85.0 * (z / 85.0 + 1.3).cos() + 5.0 / 37.0 * (z / 37.0).cos()
+pub fn road_dx(z: f32) -> f32 {
+    40.0 / 150.0 * (z / 150.0).cos() + 16.0 / 62.0 * (z / 62.0 + 1.3).cos() + 4.0 / 31.0 * (z / 31.0).cos()
 }
 
-/// Height of the road surface at road-parameter z (never below the lakes).
+fn road_ddx(z: f32) -> f32 {
+    -40.0 / (150.0 * 150.0) * (z / 150.0).sin()
+        - 16.0 / (62.0 * 62.0) * (z / 62.0 + 1.3).sin()
+        - 4.0 / (31.0 * 31.0) * (z / 31.0).sin()
+}
+
 fn road_target(z: f32) -> f32 {
-    natural(road_x(z), z).max(WATER_Y + 1.3)
+    natural(road_x(z), z)
 }
 
 pub fn terrain_h(x: f32, z: f32) -> f32 {
     let nat = natural(x, z);
     let dx = (x - road_x(z)).abs();
-    if dx >= 30.0 {
+    if dx >= 44.0 {
         return nat;
     }
-    let w = if dx <= 14.0 {
+    let w = if dx <= 22.0 {
         1.0
     } else {
-        let t = (dx - 14.0) / 16.0;
+        let t = (dx - 22.0) / 22.0;
         1.0 - t * t * (3.0 - 2.0 * t)
     };
     nat + (road_target(z) - nat) * w
 }
 
-/// (height, is_water)
-fn ground(x: f32, z: f32) -> (f32, bool) {
-    let t = terrain_h(x, z);
-    if t < WATER_Y {
-        (WATER_Y, true)
-    } else {
-        (t, false)
-    }
-}
-
 fn grad(x: f32, z: f32) -> (f32, f32) {
     let e = 1.5;
     (
-        (ground(x + e, z).0 - ground(x - e, z).0) / (2.0 * e),
-        (ground(x, z + e).0 - ground(x, z - e).0) / (2.0 * e),
+        (terrain_h(x + e, z) - terrain_h(x - e, z)) / (2.0 * e),
+        (terrain_h(x, z + e) - terrain_h(x, z - e)) / (2.0 * e),
     )
 }
 
@@ -127,28 +127,386 @@ fn road_dist(x: f32, z: f32) -> f32 {
     (x - road_x(z)).abs() / (1.0 + rp * rp).sqrt()
 }
 
-fn wall_exists(side: i32, blk: i32) -> bool {
+fn rail_exists(side: i32, blk: i32) -> bool {
     hash(blk, side * 7 + 3) % 4 != 0
+}
+
+/// Deterministic tree for a world tree-cell: (x, z, scale).
+fn tree_at(ix: i32, iz: i32) -> Option<(f32, f32, f32)> {
+    if !TREES {
+        return None;
+    }
+    let h = hash(ix * 3 + 11, iz * 5 + 7);
+    let jx = ((h >> 8) & 0xff) as f32 / 255.0;
+    let jz = ((h >> 16) & 0xff) as f32 / 255.0;
+    let x = (ix as f32 + 0.1 + 0.8 * jx) * TREE_CELL;
+    let z = (iz as f32 + 0.1 + 0.8 * jz) * TREE_CELL;
+    let dd = road_dist(x, z);
+    if dd < RAIL_OFF + 2.5 {
+        return None;
+    }
+    let p = if dd < 70.0 { 0.50 } else { 0.16 };
+    if ((h & 0xff) as f32 / 255.0) > p {
+        return None;
+    }
+    let s = 0.8 + 0.5 * (((h >> 24) & 0xff) as f32 / 255.0);
+    Some((x, z, s))
 }
 
 fn mix(a: [f32; 3], b: [f32; 3], t: f32) -> [f32; 3] {
     [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t]
 }
 
-fn terrain_color(x: f32, z: f32, h: f32, slope: f32) -> [f32; 3] {
-    let n1 = vnoise(x / 23.0 + 7.0, z / 23.0 - 3.0);
-    let n2 = vnoise(x / 6.0, z / 6.0);
-    let t = (n1 * 0.7 + n2 * 0.3).clamp(0.0, 1.0);
-    let mut c = [0.27 + 0.16 * t, 0.50 + 0.10 * t, 0.14 + 0.06 * t];
-    let dry = ((h - 3.0) / 8.0).clamp(0.0, 1.0);
-    c = mix(c, [0.55, 0.57, 0.28], dry * 0.55);
-    let beach = ((WATER_Y + 1.2 - h) / 1.2).clamp(0.0, 1.0);
-    c = mix(c, [0.72, 0.68, 0.48], beach);
-    let rock = ((slope - 0.22) / 0.2).clamp(0.0, 1.0);
-    c = mix(c, [0.45, 0.44, 0.40], rock);
-    let dx = (x - road_x(z)).abs();
-    let dirt = (1.0 - (dx - 4.0) / 6.0).clamp(0.0, 1.0);
-    mix(c, [0.40, 0.35, 0.25], dirt * 0.8)
+fn terrain_color(x: f32, z: f32, slope: f32) -> [f32; 3] {
+    let patch = vnoise(x / 45.0 + 3.0, z / 45.0 - 8.0);
+    let t = ((patch - 0.35) / 0.3).clamp(0.0, 1.0);
+    let mut c = mix([0.50, 0.78, 0.26], [0.62, 0.87, 0.34], t);
+    let fine = vnoise(x / 9.0, z / 9.0);
+    c = mix(c, [0.56, 0.82, 0.30], fine * 0.25);
+    let rock = ((slope - 0.28) / 0.2).clamp(0.0, 1.0);
+    mix(c, [0.52, 0.55, 0.40], rock * 0.6)
+}
+
+fn sand_w(z: f32, side: i32) -> f32 {
+    let sf = side as f32;
+    let t = vnoise(z / 38.0 + 13.7 * sf, 4.3 * sf);
+    ((t - 0.42) / 0.58).clamp(0.0, 1.0) * 5.0
+}
+
+struct Row {
+    rx: f32,
+    rp: f32,
+    s: f32,
+    y: f32,
+    z: f32,
+    wl: f32,
+    wr: f32,
+    kerb: i32,
+}
+
+fn make_row(z: f32) -> Row {
+    let rp = road_dx(z);
+    let ddx = road_ddx(z);
+    let s = (1.0 + rp * rp).sqrt();
+    let kappa = ddx / (s * s * s);
+    let kerb = if kappa.abs() > 0.0011 {
+        if ddx > 0.0 {
+            1
+        } else {
+            -1
+        }
+    } else {
+        0
+    };
+    Row { rx: road_x(z), rp, s, y: road_target(z), z, wl: sand_w(z, -1), wr: sand_w(z, 1), kerb }
+}
+
+fn in_chunk(x: f32, z: f32, x0: f32, z0: f32) -> bool {
+    x >= x0 && x < x0 + CHUNK && z >= z0 && z < z0 + CHUNK
+}
+
+// ------------------------------------------------------------------
+// Chunk mesh building (pure function of the world; cached by the renderer)
+// ------------------------------------------------------------------
+
+pub fn build_chunk(cx: i32, cz: i32, out: &mut Vec<Vertex>) {
+    let x0 = cx as f32 * CHUNK;
+    let z0 = cz as f32 * CHUNK;
+    build_terrain(x0, z0, out);
+    build_ribbon(x0, z0, out);
+    build_props(x0, z0, out);
+    if TREES {
+        build_trees(cx, cz, out);
+    }
+}
+
+fn build_terrain(x0: f32, z0: f32, out: &mut Vec<Vertex>) {
+    let n = CPC as usize;
+    let m = n + 3; // heights from -1 ..= n+1 so normals match across chunk borders
+    let mut hs = vec![0f32; m * m];
+    for j in 0..m {
+        for i in 0..m {
+            hs[j * m + i] = terrain_h(x0 + (i as f32 - 1.0) * CELL, z0 + (j as f32 - 1.0) * CELL);
+        }
+    }
+    let h = |i: i32, j: i32| hs[((j + 1) as usize) * m + (i + 1) as usize];
+    let sun = Vec3::new(0.45, 0.80, 0.40).normalize();
+    let stride = n + 1;
+    let mut verts: Vec<Vertex> = Vec::with_capacity(stride * stride);
+    for j in 0..=CPC {
+        for i in 0..=CPC {
+            let hl = h(i - 1, j);
+            let hr = h(i + 1, j);
+            let hd = h(i, j - 1);
+            let hu = h(i, j + 1);
+            let nrm = Vec3::new(hl - hr, 2.0 * CELL, hd - hu).normalize();
+            let slope = ((hl - hr) * (hl - hr) + (hd - hu) * (hd - hu)).sqrt() / (2.0 * CELL);
+            let x = x0 + i as f32 * CELL;
+            let z = z0 + j as f32 * CELL;
+            let base = terrain_color(x, z, slope);
+            let shade = (0.66 + 0.42 * nrm.dot(sun).max(0.0)).min(1.1);
+            verts.push(Vertex {
+                pos: [x, h(i, j), z],
+                color: [base[0] * shade, base[1] * shade, base[2] * shade],
+                kind: 1.0,
+            });
+        }
+    }
+    for j in 0..n {
+        for i in 0..n {
+            let a = verts[j * stride + i];
+            let b = verts[j * stride + i + 1];
+            let c = verts[(j + 1) * stride + i];
+            let d = verts[(j + 1) * stride + i + 1];
+            out.extend_from_slice(&[a, b, d, a, d, c]);
+        }
+    }
+}
+
+fn quad(out: &mut Vec<Vertex>, p: [[f32; 3]; 4], c: [f32; 3]) {
+    for &i in &[0usize, 1, 2, 0, 2, 3] {
+        out.push(Vertex { pos: p[i], color: c, kind: 1.0 });
+    }
+}
+
+fn scale(c: [f32; 3], k: f32) -> [f32; 3] {
+    [c[0] * k, c[1] * k, c[2] * k]
+}
+
+/// Asphalt, white edge lines, kerbs and sand run-off.
+fn build_ribbon(x0: f32, z0: f32, out: &mut Vec<Vertex>) {
+    let k0 = ((z0 - 20.0) / SEG).floor() as i32;
+    let k1 = ((z0 + CHUNK + 20.0) / SEG).ceil() as i32;
+    let rows: Vec<Row> = (k0..=k1).map(|k| make_row(k as f32 * SEG)).collect();
+    let pt = |row: &Row, off: f32, lift: f32| -> [f32; 3] {
+        [row.rx + off / row.s, row.y + lift, row.z - off * row.rp / row.s]
+    };
+    for w in rows.windows(2) {
+        let (a, b) = (&w[0], &w[1]);
+        let mx = (a.rx + b.rx) * 0.5;
+        let mz = (a.z + b.z) * 0.5;
+        if !in_chunk(mx, mz, x0, z0) {
+            continue;
+        }
+        let idx = (a.z / SEG).round() as i32;
+        let tint = 0.97 + 0.06 * h01(idx, 91);
+
+        // asphalt
+        quad(
+            out,
+            [pt(a, -ROAD_HALF, 0.16), pt(a, ROAD_HALF, 0.16), pt(b, ROAD_HALF, 0.16), pt(b, -ROAD_HALF, 0.16)],
+            scale([0.56, 0.61, 0.66], tint),
+        );
+        // white edge lines
+        for &sd in &[-1.0f32, 1.0] {
+            let o0 = sd * (ROAD_HALF - 0.38);
+            let o1 = sd * (ROAD_HALF - 0.15);
+            quad(out, [pt(a, o0, 0.2), pt(a, o1, 0.2), pt(b, o1, 0.2), pt(b, o0, 0.2)], [0.96, 0.96, 0.96]);
+        }
+        // sand run-off (varying width)
+        let sand = scale([0.93, 0.82, 0.58], tint);
+        if a.wl > 0.05 || b.wl > 0.05 {
+            let i0 = -(ROAD_HALF + 0.7);
+            quad(
+                out,
+                [pt(a, i0, 0.10), pt(a, i0 - a.wl, 0.10), pt(b, i0 - b.wl, 0.10), pt(b, i0, 0.10)],
+                sand,
+            );
+        }
+        if a.wr > 0.05 || b.wr > 0.05 {
+            let i0 = ROAD_HALF + 0.7;
+            quad(
+                out,
+                [pt(a, i0, 0.10), pt(a, i0 + a.wr, 0.10), pt(b, i0 + b.wr, 0.10), pt(b, i0, 0.10)],
+                sand,
+            );
+        }
+        // black / white kerbs on the inside of bends
+        if a.kerb != 0 {
+            let sd = a.kerb as f32;
+            let o0 = sd * ROAD_HALF;
+            let o1 = sd * (ROAD_HALF + 1.3);
+            let c = if idx & 1 == 0 { [0.12, 0.12, 0.14] } else { [0.96, 0.96, 0.96] };
+            quad(out, [pt(a, o0, 0.2), pt(a, o1, 0.2), pt(b, o1, 0.2), pt(b, o0, 0.2)], c);
+        }
+    }
+}
+
+/// Guard rails, street lamps and chevron signs.
+fn build_props(x0: f32, z0: f32, out: &mut Vec<Vertex>) {
+    let z_lo = z0 - 14.0;
+    let z_hi = z0 + CHUNK + 14.0;
+
+    // ---- guard rails ----
+    for side in [-1i32, 1] {
+        let sf = side as f32;
+        let b0 = (z_lo / BLOCK).floor() as i32;
+        let b1 = (z_hi / BLOCK).floor() as i32;
+        for blk in b0..=b1 {
+            if !rail_exists(side, blk) {
+                continue;
+            }
+            let zr = (blk as f32 + 0.5) * BLOCK;
+            let rp = road_dx(zr);
+            let s = (1.0 + rp * rp).sqrt();
+            let cx = road_x(zr) + sf * RAIL_OFF / s;
+            let cz = zr - sf * RAIL_OFF * rp / s;
+            if !in_chunk(cx, cz, x0, z0) {
+                continue;
+            }
+            let gy = road_target(zr);
+            let m = Mat4::from_translation(Vec3::new(cx, gy, cz)) * Mat4::from_rotation_y(rp.atan());
+            push_box(out, m, Vec3::new(0.0, 0.62, 0.0), Vec3::new(0.05, 0.17, BLOCK * 0.48), [0.60, 0.65, 0.70]);
+            push_box(out, m, Vec3::new(0.0, 0.34, 0.0), Vec3::new(0.04, 0.08, BLOCK * 0.48), [0.52, 0.57, 0.62]);
+            push_box(out, m, Vec3::new(0.0, 0.40, 0.0), Vec3::new(0.06, 0.40, 0.06), [0.40, 0.44, 0.48]);
+        }
+    }
+
+    // ---- street lamps ----
+    let l0 = (z_lo / LAMP).floor() as i32;
+    let l1 = (z_hi / LAMP).floor() as i32;
+    for lm in l0..=l1 {
+        if hash(lm, 555) % 10 >= 8 {
+            continue;
+        }
+        let side: i32 = if lm & 1 == 0 { 1 } else { -1 };
+        let sf = side as f32;
+        let zr = (lm as f32 + 0.5) * LAMP;
+        let rp = road_dx(zr);
+        let s = (1.0 + rp * rp).sqrt();
+        let off = ROAD_HALF + 3.4;
+        let cx = road_x(zr) + sf * off / s;
+        let cz = zr - sf * off * rp / s;
+        if !in_chunk(cx, cz, x0, z0) {
+            continue;
+        }
+        let gy = road_target(zr);
+        let m = Mat4::from_translation(Vec3::new(cx, gy, cz)) * Mat4::from_rotation_y(rp.atan());
+        let pole = [0.42, 0.50, 0.57];
+        push_box(out, m, Vec3::new(0.0, 3.8, 0.0), Vec3::new(0.11, 3.8, 0.11), pole);
+        push_box(out, m, Vec3::new(-sf * 1.3, 7.55, 0.0), Vec3::new(1.4, 0.07, 0.07), pole);
+        push_box(out, m, Vec3::new(-sf * 2.6, 7.42, 0.0), Vec3::new(0.45, 0.08, 0.18), [0.95, 0.95, 0.80]);
+    }
+
+    // ---- red chevron signs on the outside of sharp bends ----
+    let s0 = (z_lo / SIGN).floor() as i32;
+    let s1 = (z_hi / SIGN).floor() as i32;
+    for sg in s0..=s1 {
+        let zr = (sg as f32 + 0.5) * SIGN;
+        let ddx = road_ddx(zr);
+        let rp = road_dx(zr);
+        let s = (1.0 + rp * rp).sqrt();
+        let kappa = ddx / (s * s * s);
+        if kappa.abs() < 0.0016 {
+            continue;
+        }
+        let side: i32 = if ddx > 0.0 { -1 } else { 1 }; // outside of the bend
+        let sf = side as f32;
+        let off = RAIL_OFF - 1.6;
+        let cx = road_x(zr) + sf * off / s;
+        let cz = zr - sf * off * rp / s;
+        if !in_chunk(cx, cz, x0, z0) {
+            continue;
+        }
+        let gy = road_target(zr);
+        let m = Mat4::from_translation(Vec3::new(cx, gy, cz)) * Mat4::from_rotation_y(rp.atan());
+        push_box(out, m, Vec3::new(0.0, 1.0, 0.0), Vec3::new(0.05, 1.0, 0.05), [0.40, 0.44, 0.48]);
+        push_box(out, m, Vec3::new(0.0, 2.1, 0.0), Vec3::new(0.55, 0.55, 0.04), [0.96, 0.96, 0.96]);
+        push_box(out, m, Vec3::new(0.0, 2.1, 0.05), Vec3::new(0.38, 0.38, 0.03), [0.85, 0.10, 0.10]);
+    }
+}
+
+/// Low-poly trees: tall dark trunk and three faceted canopy blobs.
+fn build_trees(cx: i32, cz: i32, out: &mut Vec<Vertex>) {
+    for ix in cx * TPC..cx * TPC + TPC {
+        for iz in cz * TPC..cz * TPC + TPC {
+            let Some((x, z, s)) = tree_at(ix, iz) else { continue };
+            let h = hash(ix, iz);
+            let gy = terrain_h(x, z);
+            let th = 6.5 * s;
+            let yaw = (h & 0xff) as f32 / 255.0 * 6.283;
+            let m = Mat4::from_translation(Vec3::new(x, gy + th * 0.5 - 0.2, z)) * Mat4::from_rotation_y(yaw);
+            push_box(out, m, Vec3::ZERO, Vec3::new(0.28 * s, th * 0.5 + 0.2, 0.28 * s), [0.24, 0.14, 0.11]);
+
+            let v = ((h >> 4) & 0xff) as f32 / 255.0;
+            let top = [0.28 + 0.12 * v, 0.62 + 0.10 * v, 0.14 + 0.06 * v];
+            let bot = [0.10, 0.30, 0.08];
+            let cy = gy + th + 0.6 * s;
+            let seed = (h & 0x7fff) as i32;
+            push_blob(out, Vec3::new(x, cy, z), Vec3::new(3.4 * s, 1.7 * s, 3.4 * s), top, bot, seed, 6, 3, 0.22);
+            push_blob(out, Vec3::new(x + 1.9 * s, cy + 1.0 * s, z - 1.0 * s), Vec3::new(2.5 * s, 1.3 * s, 2.5 * s), top, bot, seed + 5, 6, 3, 0.22);
+            push_blob(out, Vec3::new(x - 1.7 * s, cy + 1.2 * s, z + 1.3 * s), Vec3::new(2.3 * s, 1.2 * s, 2.3 * s), top, bot, seed + 9, 6, 3, 0.22);
+        }
+    }
+}
+
+/// Faceted, flat-shaded blob (tree canopy / balloon).
+fn push_blob(
+    out: &mut Vec<Vertex>,
+    c: Vec3,
+    r: Vec3,
+    top: [f32; 3],
+    bot: [f32; 3],
+    seed: i32,
+    segs: usize,
+    rings: usize,
+    jit: f32,
+) {
+    use std::f32::consts::{FRAC_PI_2, PI, TAU};
+    let sun = Vec3::new(0.45, 0.80, 0.40).normalize();
+    let mut pts: Vec<Vec3> = Vec::with_capacity((rings + 1) * segs);
+    for k in 0..=rings {
+        let phi = -FRAC_PI_2 + PI * k as f32 / rings as f32;
+        let (sp, cp) = phi.sin_cos();
+        for i in 0..segs {
+            let th = TAU * i as f32 / segs as f32;
+            let j = if k == 0 || k == rings {
+                1.0
+            } else {
+                1.0 + jit * (h01(seed + k as i32 * 13, i as i32 * 7 + seed) - 0.5) * 2.0
+            };
+            pts.push(Vec3::new(
+                c.x + r.x * cp * th.cos() * j,
+                c.y + r.y * sp * j,
+                c.z + r.z * cp * th.sin() * j,
+            ));
+        }
+    }
+    let at = |k: usize, i: usize| pts[k * segs + (i % segs)];
+    let emit = |out: &mut Vec<Vertex>, p0: Vec3, p1: Vec3, p2: Vec3| {
+        let n = (p1 - p0).cross(p2 - p0);
+        let len = n.length();
+        if len < 1e-6 {
+            return;
+        }
+        let mut n = n / len;
+        let cen = (p0 + p1 + p2) / 3.0;
+        if n.dot(cen - c) < 0.0 {
+            n = n * -1.0;
+        }
+        let shade = (0.60 + 0.55 * n.dot(sun).max(0.0)).min(1.15);
+        let t = (((cen.y - c.y) / r.y) * 0.5 + 0.5).clamp(0.0, 1.0);
+        let col = scale(mix(bot, top, t), shade);
+        for p in [p0, p1, p2] {
+            out.push(Vertex { pos: p.to_array(), color: col, kind: 1.0 });
+        }
+    };
+    for k in 0..rings {
+        for i in 0..segs {
+            let a = at(k, i);
+            let b = at(k, i + 1);
+            let cc = at(k + 1, i + 1);
+            let d = at(k + 1, i);
+            if k == 0 {
+                emit(out, a, cc, d);
+            } else if k == rings - 1 {
+                emit(out, a, b, d);
+            } else {
+                emit(out, a, b, cc);
+                emit(out, a, cc, d);
+            }
+        }
+    }
 }
 
 // ------------------------------------------------------------------
@@ -172,7 +530,7 @@ pub struct Game {
 impl Game {
     pub fn new() -> Self {
         let x = road_x(0.0);
-        let y = ground(x, 0.0).0;
+        let y = terrain_h(x, 0.0);
         Self {
             pos: Vec3::new(x, y, 0.0),
             vel: Vec3::ZERO,
@@ -206,8 +564,9 @@ impl Game {
         let mut vf = self.vel.dot(f);
         let mut vr = self.vel.dot(r);
 
-        let (_, in_water) = ground(self.pos.x, self.pos.z);
-        let on_road = road_dist(self.pos.x, self.pos.z) < ROAD_HALF + 0.5;
+        let dperp = road_dist(self.pos.x, self.pos.z);
+        let on_road = dperp < ROAD_HALF + 0.3;
+        let on_sand = !on_road && dperp < ROAD_HALF + 4.0;
 
         self.steer += (input.steer - self.steer) * (dt * 7.0).min(1.0);
 
@@ -220,10 +579,10 @@ impl Game {
             if !input.throttle && vf > 0.0 {
                 vf = (vf - 1.2 * dt).max(0.0); // engine braking
             }
-            let surface_drag = if in_water {
-                3.0
-            } else if on_road {
+            let surface_drag = if on_road {
                 0.0
+            } else if on_sand {
+                0.07
             } else {
                 0.12
             };
@@ -232,20 +591,20 @@ impl Game {
                 vf -= 2.0 * vf * dt; // rolling backwards stops quickly
             }
 
-            // Dirt grip: lower off-road, and the bike slides when turned hard at speed.
-            let grip = if in_water {
-                1.0
-            } else if on_road {
+            // Grip: best on asphalt; the bike slides when turned hard at speed.
+            let grip = if on_road {
                 4.5
+            } else if on_sand {
+                3.0
             } else {
-                2.6
+                2.4
             };
             let slide = 1.0 / (1.0 + self.steer.abs() * vf.abs() / 22.0);
             vr *= (-grip * slide * dt).exp();
 
             self.vel = f * vf + r * vr;
 
-            // Gravity along the slope: downhill speeds you up, uphill slows you down.
+            // Gravity along the slope.
             let (gx, gz) = grad(self.pos.x, self.pos.z);
             self.vel.x -= gx * G * 0.7 * dt;
             self.vel.z -= gz * G * 0.7 * dt;
@@ -266,10 +625,11 @@ impl Game {
         self.pos.x += self.vel.x * dt;
         self.pos.z += self.vel.z * dt;
 
-        self.wall_collision();
+        self.rail_collision();
+        self.tree_collision();
 
         // Vertical motion: follow the ground, or fly off crests.
-        let (g1, _) = ground(self.pos.x, self.pos.z);
+        let g1 = terrain_h(self.pos.x, self.pos.z);
         self.vy -= G * dt;
         let y_new = self.pos.y + self.vy * dt;
         if y_new <= g1 {
@@ -303,29 +663,28 @@ impl Game {
         self.pitch += (target_pitch.clamp(-0.6, 0.6) - self.pitch) * (dt * 5.0).min(1.0);
     }
 
-    /// Solid stone walls along the road (they have gaps, so you can leave the track).
-    fn wall_collision(&mut self) {
+    /// Solid guard rails along the track (they have gaps, so you can leave it).
+    fn rail_collision(&mut self) {
         let z = self.pos.z;
         let rp = road_dx(z);
         let s = (1.0 + rp * rp).sqrt();
         let d = (self.pos.x - road_x(z)) / s;
         let ad = d.abs();
-        if ad < 3.9 || ad > 5.4 {
+        if ad < RAIL_OFF - 1.2 || ad > RAIL_OFF + 1.2 {
             return;
         }
-        let (gh, _) = ground(self.pos.x, self.pos.z);
-        if self.pos.y - gh > 0.9 {
+        if self.pos.y - terrain_h(self.pos.x, self.pos.z) > 0.7 {
             return; // flying over it
         }
         let side: i32 = if d > 0.0 { 1 } else { -1 };
         let sf = side as f32;
         let zr = z + d * rp / s;
         let blk = (zr / BLOCK).floor() as i32;
-        if !wall_exists(side, blk) {
+        if !rail_exists(side, blk) {
             return;
         }
-        let from_road = ad < WALL_OFF;
-        let target = if from_road { 3.85 } else { 5.5 };
+        let from_road = ad < RAIL_OFF;
+        let target = if from_road { RAIL_OFF - 1.05 } else { RAIL_OFF + 1.05 };
         self.pos.x = road_x(z) + sf * target * s;
 
         let n = Vec3::new(1.0, 0.0, -rp) / s * sf;
@@ -337,123 +696,62 @@ impl Game {
         }
     }
 
-    /// Terrain, water, road and stone walls, in world space.
-    pub fn build_world(&self, out: &mut Vec<Vertex>) {
-        // ---- terrain on a fixed world grid (no vertex swimming) ----
-        let half = (N / 2) as f32;
-        let x0 = (self.pos.x / CELL).floor() * CELL - half * CELL;
-        let z0 = (self.pos.z / CELL).floor() * CELL - half * CELL;
-        let n1 = (N + 1) as usize;
-        let mut hs = vec![0f32; n1 * n1];
-        for j in 0..n1 {
-            for i in 0..n1 {
-                hs[j * n1 + i] = terrain_h(x0 + i as f32 * CELL, z0 + j as f32 * CELL);
-            }
-        }
-        let at = |i: usize, j: usize| hs[j.min(n1 - 1) * n1 + i.min(n1 - 1)];
-        let sun = Vec3::new(0.45, 0.80, 0.40).normalize();
-        let mut cols = vec![[0f32; 3]; n1 * n1];
-        for j in 0..n1 {
-            for i in 0..n1 {
-                let hl = at(i.saturating_sub(1), j);
-                let hr = at(i + 1, j);
-                let hd = at(i, j.saturating_sub(1));
-                let hu = at(i, j + 1);
-                let nrm = Vec3::new(hl - hr, 2.0 * CELL, hd - hu).normalize();
-                let slope = ((hl - hr) * (hl - hr) + (hd - hu) * (hd - hu)).sqrt() / (2.0 * CELL);
-                let x = x0 + i as f32 * CELL;
-                let z = z0 + j as f32 * CELL;
-                let base = terrain_color(x, z, hs[j * n1 + i], slope);
-                let shade = (0.50 + 0.60 * nrm.dot(sun).max(0.0)).min(1.1);
-                cols[j * n1 + i] = [base[0] * shade, base[1] * shade, base[2] * shade];
-            }
-        }
-        let vert = |i: usize, j: usize| Vertex {
-            pos: [x0 + i as f32 * CELL, hs[j * n1 + i], z0 + j as f32 * CELL],
-            color: cols[j * n1 + i],
-            kind: 1.0,
-        };
-        for j in 0..N as usize {
-            for i in 0..N as usize {
-                let a = vert(i, j);
-                let b = vert(i + 1, j);
-                let c = vert(i, j + 1);
-                let d = vert(i + 1, j + 1);
-                out.extend_from_slice(&[a, b, d, a, d, c]);
-            }
-        }
-
-        // ---- lakes ----
-        let wc = [0.12, 0.30, 0.45];
-        let (wx, wz, ws) = (self.pos.x, self.pos.z, 900.0);
-        let wq = [
-            [wx - ws, WATER_Y, wz - ws],
-            [wx + ws, WATER_Y, wz - ws],
-            [wx + ws, WATER_Y, wz + ws],
-            [wx - ws, WATER_Y, wz + ws],
-        ];
-        for &i in &[0usize, 1, 2, 0, 2, 3] {
-            out.push(Vertex { pos: wq[i], color: wc, kind: 1.0 });
-        }
-
-        // ---- road ribbon ----
-        let zr0 = (self.pos.z / SEG).floor() * SEG - VIEW;
-        let nseg = (2.0 * VIEW / SEG) as usize;
-        struct Row {
-            rx: f32,
-            rp: f32,
-            s: f32,
-            y: f32,
-            z: f32,
-        }
-        let mut rows: Vec<Row> = Vec::with_capacity(nseg + 1);
-        for k in 0..=nseg {
-            let z = zr0 + k as f32 * SEG;
-            let rp = road_dx(z);
-            rows.push(Row { rx: road_x(z), rp, s: (1.0 + rp * rp).sqrt(), y: road_target(z), z });
-        }
-        let pt = |row: &Row, off: f32, lift: f32| -> [f32; 3] {
-            [row.rx + off / row.s, row.y + lift, row.z - off * row.rp / row.s]
-        };
-        let strips: [(f32, f32, f32, [f32; 3]); 5] = [
-            (-3.8, 3.8, 0.10, [0.40, 0.35, 0.26]),  // dirt shoulder
-            (-3.0, 3.0, 0.14, [0.58, 0.55, 0.50]),  // gravel road
-            (-1.5, -0.7, 0.16, [0.46, 0.43, 0.39]), // wheel tracks
-            (0.7, 1.5, 0.16, [0.46, 0.43, 0.39]),
-            (-0.15, 0.15, 0.16, [0.52, 0.49, 0.44]), // centre crown
-        ];
-        for k in 0..nseg {
-            let (a, b) = (&rows[k], &rows[k + 1]);
-            let tint = 0.94 + 0.12 * h01((a.z / SEG).floor() as i32, 91);
-            for &(o0, o1, lift, col) in strips.iter() {
-                let c = [col[0] * tint, col[1] * tint, col[2] * tint];
-                let p = [pt(a, o0, lift), pt(a, o1, lift), pt(b, o1, lift), pt(b, o0, lift)];
-                for &i in &[0usize, 1, 2, 0, 2, 3] {
-                    out.push(Vertex { pos: p[i], color: c, kind: 1.0 });
+    /// Tree trunks are solid.
+    fn tree_collision(&mut self) {
+        let ix0 = (self.pos.x / TREE_CELL).floor() as i32;
+        let iz0 = (self.pos.z / TREE_CELL).floor() as i32;
+        for ix in ix0 - 1..=ix0 + 1 {
+            for iz in iz0 - 1..=iz0 + 1 {
+                let Some((tx, tz, s)) = tree_at(ix, iz) else { continue };
+                let dx = self.pos.x - tx;
+                let dz = self.pos.z - tz;
+                let rr = 0.45 * s + 0.35;
+                let d2 = dx * dx + dz * dz;
+                if d2 < rr * rr {
+                    let d = d2.sqrt().max(0.01);
+                    let (nx, nz) = (dx / d, dz / d);
+                    self.pos.x = tx + nx * rr;
+                    self.pos.z = tz + nz * rr;
+                    let vn = self.vel.x * nx + self.vel.z * nz;
+                    if vn < 0.0 {
+                        self.vel.x -= vn * nx * 1.3;
+                        self.vel.z -= vn * nz * 1.3;
+                        self.vel = self.vel * 0.6;
+                    }
                 }
             }
         }
+    }
 
-        // ---- stone walls ----
-        let blk0 = ((self.pos.z - VIEW) / BLOCK).floor() as i32;
-        let blk1 = ((self.pos.z + VIEW) / BLOCK).floor() as i32;
-        for side in [-1i32, 1] {
-            let sf = side as f32;
-            for blk in blk0..=blk1 {
-                if !wall_exists(side, blk) {
-                    continue;
-                }
-                let zr = (blk as f32 + 0.5) * BLOCK;
-                let rp = road_dx(zr);
-                let s = (1.0 + rp * rp).sqrt();
-                let cx = road_x(zr) + sf * WALL_OFF / s;
-                let cz = zr - sf * WALL_OFF * rp / s;
-                let gy = road_target(zr);
-                let m = Mat4::from_translation(Vec3::new(cx, gy + 0.40, cz)) * Mat4::from_rotation_y(rp.atan());
-                let v = h01(blk, side + 50);
-                let col = [0.48 + 0.10 * v, 0.47 + 0.10 * v, 0.43 + 0.09 * v];
-                push_box(out, m, Vec3::ZERO, Vec3::new(0.28, 0.55, BLOCK * 0.5 * 0.97), col);
-            }
+    /// Hot-air balloons drifting in the sky (a few hundred vertices, rebuilt each frame).
+    pub fn build_balloons(&self, out: &mut Vec<Vertex>) {
+        const SPACING: f32 = 380.0;
+        let t0 = ((self.pos.z - 450.0) / SPACING).floor() as i32;
+        let t1 = ((self.pos.z + 450.0) / SPACING).floor() as i32;
+        for t in t0..=t1 {
+            let hh = hash(t, 777);
+            let bz = t as f32 * SPACING + (hh % 300) as f32;
+            let sgn = if hh & 0x100 != 0 { 1.0 } else { -1.0 };
+            let bx = road_x(bz) + sgn * (70.0 + ((hh >> 12) & 63) as f32);
+            let by = 62.0 + ((hh >> 20) & 15) as f32;
+            push_blob(
+                out,
+                Vec3::new(bx, by, bz),
+                Vec3::new(9.0, 11.0, 9.0),
+                [0.98, 0.45, 0.12],
+                [0.60, 0.26, 0.16],
+                t,
+                10,
+                6,
+                0.04,
+            );
+            push_box(
+                out,
+                Mat4::from_translation(Vec3::new(bx, by - 13.5, bz)),
+                Vec3::ZERO,
+                Vec3::new(0.9, 0.6, 0.9),
+                [0.35, 0.22, 0.12],
+            );
         }
     }
 

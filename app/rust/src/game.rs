@@ -747,12 +747,12 @@ pub struct Bld {
 
 const BLD_CELL: f32 = 200.0;
 /// Which local axis is the facade of each model (true = +x, false = +z).
-const FRONT_X: [bool; 3] = [true, true, false];
+const FRONT_X: [bool; 6] = [true, true, false, false, false, false];
 
 fn bld_compute(iz: i32) -> Vec<Bld> {
     let ms = models();
     let mut res = Vec::new();
-    if ms.len() < 3 {
+    if ms.is_empty() {
         return res;
     }
     let h = hash(iz * 7 + 1, 4242);
@@ -763,7 +763,7 @@ fn bld_compute(iz: i32) -> Vec<Bld> {
     let mut zr = iz as f32 * BLD_CELL + 25.0 + 50.0 * h01(iz, 31);
     for k in 0..count {
         let hk = hash(iz * 11 + k, 777);
-        let mi = (hk % 3) as usize;
+        let mi = (hk as usize) % ms.len();
         let m = &ms[mi];
         let rad = m.hx.max(m.hz);
         let rp = road_dx(zr);
@@ -789,7 +789,7 @@ fn bld_compute(iz: i32) -> Vec<Bld> {
             // face the road
             let (dx, dz) = (-side / s, side * rp / s);
             let jit = (h01(iz * 5 + k, 99) - 0.5) * 0.16;
-            let yaw = if FRONT_X[mi] { (-dz).atan2(dx) } else { dx.atan2(dz) } + jit;
+            let yaw = if FRONT_X.get(mi).copied().unwrap_or(false) { (-dz).atan2(dx) } else { dx.atan2(dz) } + jit;
             res.push(Bld { model: mi, x: bx, y: lo - 0.3, z: bz, yaw, hx: m.hx, hz: m.hz });
         }
         zr += 2.0 * rad + 14.0 + 18.0 * h01(iz * 3 + k, 55);

@@ -857,7 +857,7 @@ pub struct Bld {
 
 const BLD_CELL: f32 = 200.0;
 /// Which local axis is the facade of each model (true = +x, false = +z).
-const FRONT_X: [bool; 6] = [true, true, false, false, false, false];
+const FRONT_X: [bool; 8] = [true, true, false, false, false, false, false, false];
 
 fn bld_compute(iz: i32) -> Vec<Bld> {
     let ms = models();
@@ -903,6 +903,9 @@ fn bld_compute(iz: i32) -> Vec<Bld> {
             res.push(Bld { model: mi, x: bx, y: lo - 0.3, z: bz, yaw, hx: m.hx, hz: m.hz });
         }
         zr += 2.0 * rad + 14.0 + 18.0 * h01(iz * 3 + k, 55);
+        if zr > (iz + 1) as f32 * BLD_CELL - 12.0 {
+            break; // keep each cell's buildings inside the cell
+        }
     }
     res
 }
@@ -1511,22 +1514,11 @@ impl Game {
         self.bull_collision();
         self.car_collision();
 
-        // ---------------- vertical: follow the ground or fly (jumps) ----------------
+        // ---------------- vertical: no jumping - the bike always stays glued to the ground ----------------
         let g1 = terrain_h(self.pos.x, self.pos.z);
-        self.vy -= G * dt;
-        let y_new = self.pos.y + self.vy * dt;
-        if y_new <= g1 {
-            if self.grounded {
-                self.vy = ((g1 - self.pos.y) / dt).clamp(-25.0, 25.0);
-            } else {
-                self.land(g1);
-            }
-            self.pos.y = g1;
-            self.grounded = true;
-        } else {
-            self.pos.y = y_new;
-            self.grounded = false;
-        }
+        self.vy = ((g1 - self.pos.y) / dt.max(1e-3)).clamp(-25.0, 25.0);
+        self.pos.y = g1;
+        self.grounded = true;
 
         self.speed = self.vel.length();
         let f2 = self.forward();
@@ -1592,7 +1584,8 @@ impl Game {
         self.rider[2] += (tz - self.rider[2]) * k;
     }
 
-    /// Touchdown after a jump: the suspension absorbs the hit; a bad attitude or a huge drop costs speed.
+    #[allow(dead_code)]
+    /// Touchdown after a jump (unused while jumping is disabled): the suspension absorbs the hit; a bad attitude or a huge drop costs speed.
     fn land(&mut self, g1: f32) {
         let (gx, gz) = grad(self.pos.x, self.pos.z);
         let n = Vec3::new(-gx, 1.0, -gz).normalize();

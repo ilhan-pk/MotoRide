@@ -8,11 +8,11 @@ posts for speed feel (hitting one slows you down). Pure Rust + wgpu, no Java/Kot
 ## Versions
 - Gradle **9.1.0** (gradle/wrapper/gradle-wrapper.properties)
 - Android Gradle Plugin **9.0.1** (AGP 9.x is what requires Gradle 9.1+)
-- JDK 17+, compileSdk 35, minSdk 26, ABIs: arm64-v8a, x86_64
+- JDK 17+, compileSdk 35, minSdk 26, ABIs: arm64-v8a, armeabi-v7a (32-bit), x86_64
 
 ## One-time setup
 1. Install Rust: https://rustup.rs
-2. `rustup target add aarch64-linux-android x86_64-linux-android`
+2. `rustup target add aarch64-linux-android armv7-linux-androideabi x86_64-linux-android`
 3. `cargo install cargo-ndk`
 4. Android Studio -> SDK Manager -> SDK Tools -> install **NDK (Side by side)**
 5. Make sure `ANDROID_NDK_HOME` points to the installed NDK (cargo-ndk needs it)

@@ -12,7 +12,7 @@ android {
         targetSdk = 35
         versionCode = 1
         versionName = "0.1"
-        ndk { abiFilters += listOf("arm64-v8a", "x86_64") }
+        ndk { abiFilters += listOf("arm64-v8a", "armeabi-v7a", "x86_64") }
     }
 
     buildTypes {
@@ -36,7 +36,7 @@ val cargoNdkBuild by tasks.registering(Exec::class) {
     onlyIf { hasCargo }
     workingDir = file("rust")
     val cmd = mutableListOf("cargo", "ndk")
-    listOf("arm64-v8a", "x86_64").forEach { cmd += listOf("-t", it) }
+    listOf("arm64-v8a", "armeabi-v7a", "x86_64").forEach { cmd += listOf("-t", it) }
     cmd += listOf("-o", jniDir.absolutePath, "build", "--release", "--lib")
     commandLine(cmd)
 }

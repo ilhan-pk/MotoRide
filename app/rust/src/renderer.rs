@@ -6,7 +6,7 @@ use glam::{Mat4, Vec3};
 use wgpu::util::{BufferInitDescriptor, DeviceExt};
 use winit::window::Window;
 
-use crate::game::{build_chunk, buildings_around, car_models, fox_model, models, Game, Vertex, CHUNK, FOX_SCALE};
+use crate::game::{build_chunk, bull_model, bulls_around, buildings_around, car_models, fox_model, models, Game, Vertex, BULL_ANIM_FPS, CHUNK, FOX_SCALE};
 use crate::hud;
 
 const MAX_BALLOON_VERTS: usize = 3_000;
@@ -67,6 +67,8 @@ pub struct Renderer {
     fox_vb: wgpu::Buffer,
     fox_ub: wgpu::Buffer,
     fox_bg: wgpu::BindGroup,
+    bull_vb: wgpu::Buffer,
+    bull_pool: Vec<(wgpu::Buffer, wgpu::BindGroup)>,
 }
 
 fn make_depth(device: &wgpu::Device, w: u32, h: u32) -> wgpu::TextureView {
@@ -272,6 +274,11 @@ impl Renderer {
             contents: bytemuck::cast_slice(&fox_model().verts),
             usage: wgpu::BufferUsages::VERTEX,
         });
+        let bull_vb = device.create_buffer_init(&BufferInitDescriptor {
+            label: Some("bull"),
+            contents: bytemuck::cast_slice(&bull_model().verts),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
         let fox_ub = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("fox_ub"),
             size: std::mem::size_of::<Uniforms>() as u64,
@@ -334,6 +341,8 @@ impl Renderer {
             fox_vb,
             fox_ub,
             fox_bg,
+            bull_vb,
+            bull_pool: Vec::new(),
         }
     }
 
@@ -621,6 +630,60 @@ impl Renderer {
             }
         }
 
+        // ---- grazing bulls: one draw each (current animation frame), nearby ones only ----
+        let mut bull_draw: Vec<(usize, u32, u32)> = Vec::with_capacity(16);
+        {
+            let bm = bull_model();
+            for b in bulls_around(eye.z) {
+                if bull_draw.len() >= 16 {
+                    break;
+                }
+                let dx = b.x - eye.x;
+                let dz = b.z - eye.z;
+                let dist = (dx * dx + dz * dz).sqrt();
+                if dist > 250.0 {
+                    continue;
+                }
+                let along = dx * f.x + dz * f.z;
+                let perp = (dx * f.z - dz * f.x).abs();
+                if dist > 30.0 && (along < -10.0 || perp > along.max(0.0) * tan_h * 1.2 + 30.0) {
+                    continue;
+                }
+                let i = bull_draw.len();
+                if self.bull_pool.len() <= i {
+                    let ub = self.device.create_buffer(&wgpu::BufferDescriptor {
+                        label: Some("bull_ub"),
+                        size: std::mem::size_of::<Uniforms>() as u64,
+                        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                        mapped_at_creation: false,
+                    });
+                    let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: None,
+                        layout: &self.bgl,
+                        entries: &[wgpu::BindGroupEntry { binding: 0, resource: ub.as_entire_binding() }],
+                    });
+                    self.bull_pool.push((ub, bg));
+                }
+                let model = Mat4::from_translation(Vec3::new(b.x, b.y, b.z))
+                    * Mat4::from_rotation_y(b.yaw)
+                    * Mat4::from_scale(Vec3::splat(b.scale));
+                let t = ((dist - 200.0) / 50.0).clamp(0.0, 1.0);
+                let hidden = t * t * (3.0 - 2.0 * t);
+                self.queue.write_buffer(
+                    &self.bull_pool[i].0,
+                    0,
+                    bytemuck::bytes_of(&Uniforms {
+                        vp: (proj * view * model).to_cols_array_2d(),
+                        fog: FOG,
+                        params: [1.0 / 240.0, hidden, 0.0, 0.0],
+                    }),
+                );
+                let fr = ((g.time * BULL_ANIM_FPS + b.phase * bm.frames as f32) as usize) % bm.frames;
+                let a = (fr * bm.per_frame) as u32;
+                bull_draw.push((i, a, a + bm.per_frame as u32));
+            }
+        }
+
         let mut visible: Vec<&Chunk> = Vec::with_capacity(48);
         for (key, chunk) in self.chunks.iter() {
             let cx = (key.0 as f32 + 0.5) * CHUNK - eye.x;
@@ -695,6 +758,12 @@ impl Renderer {
                     pass.set_vertex_buffer(0, vb.slice(..));
                     pass.draw(0..*count, 0..1);
                 }
+            }
+
+            for &(i, a, b) in bull_draw.iter() {
+                pass.set_bind_group(0, &self.bull_pool[i].1, &[]);
+                pass.set_vertex_buffer(0, self.bull_vb.slice(..));
+                pass.draw(a..b, 0..1);
             }
 
             if let Some((a, b)) = fox_draw {

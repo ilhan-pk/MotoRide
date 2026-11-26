@@ -191,7 +191,7 @@ fn tree_at(ix: i32, iz: i32) -> Option<(f32, f32, f32)> {
     if dd < RAIL_OFF + 2.5 {
         return None;
     }
-    if near_building(x, z, 3.0) {
+    if near_building(x, z, 3.0) || near_bull(x, z, 2.5) {
         return None;
     }
     let p = (if dd < 70.0 { 0.50 } else { 0.16 }) * TREE_DENSITY;
@@ -492,6 +492,7 @@ fn build_props(x0: f32, z0: f32, out: &mut Vec<Vertex>) {
 // ------------------------------------------------------------------
 
 static FOX_BIN: &[u8] = include_bytes!("fox.bin");
+static BULL_BIN: &[u8] = include_bytes!("bull.bin");
 
 pub struct FoxModel {
     /// all frames, one after another (`per_frame` vertices each)
@@ -502,60 +503,67 @@ pub struct FoxModel {
 
 pub fn fox_model() -> &'static FoxModel {
     static M: std::sync::OnceLock<FoxModel> = std::sync::OnceLock::new();
-    M.get_or_init(|| {
-        let d = FOX_BIN;
-        let u32at = |o: usize| u32::from_le_bytes([d[o], d[o + 1], d[o + 2], d[o + 3]]) as usize;
-        let f32at = |o: usize| f32::from_le_bytes([d[o], d[o + 1], d[o + 2], d[o + 3]]);
-        let nf = u32at(0);
-        let nv = u32at(4);
-        let ni = u32at(8);
-        let mut o = 24usize;
-        let col_o = o;
-        o += nv * 3;
-        o = (o + 3) & !3;
-        let idx_o = o;
-        o += ni * 2;
-        o = (o + 3) & !3;
-        let pos_o = o;
-        let mut verts = Vec::with_capacity(nf * ni);
-        for f in 0..nf {
-            let base = pos_o + f * nv * 12;
-            let p = |i: usize| -> [f32; 3] {
-                let q = base + i * 12;
-                [f32at(q), f32at(q + 4), f32at(q + 8)]
+    M.get_or_init(|| parse_anim(FOX_BIN))
+}
+
+pub fn bull_model() -> &'static FoxModel {
+    static M: std::sync::OnceLock<FoxModel> = std::sync::OnceLock::new();
+    M.get_or_init(|| parse_anim(BULL_BIN))
+}
+
+/// Baked skeletal animation: all frames as plain flat-shaded triangles.
+fn parse_anim(d: &'static [u8]) -> FoxModel {
+    let u32at = |o: usize| u32::from_le_bytes([d[o], d[o + 1], d[o + 2], d[o + 3]]) as usize;
+    let f32at = |o: usize| f32::from_le_bytes([d[o], d[o + 1], d[o + 2], d[o + 3]]);
+    let nf = u32at(0);
+    let nv = u32at(4);
+    let ni = u32at(8);
+    let mut o = 24usize;
+    let col_o = o;
+    o += nv * 3;
+    o = (o + 3) & !3;
+    let idx_o = o;
+    o += ni * 2;
+    o = (o + 3) & !3;
+    let pos_o = o;
+    let mut verts = Vec::with_capacity(nf * ni);
+    for f in 0..nf {
+        let base = pos_o + f * nv * 12;
+        let p = |i: usize| -> [f32; 3] {
+            let q = base + i * 12;
+            [f32at(q), f32at(q + 4), f32at(q + 8)]
+        };
+        for t in 0..ni / 3 {
+            let ix = |k: usize| {
+                let q = idx_o + (t * 3 + k) * 2;
+                u16::from_le_bytes([d[q], d[q + 1]]) as usize
             };
-            for t in 0..ni / 3 {
-                let ix = |k: usize| {
-                    let q = idx_o + (t * 3 + k) * 2;
-                    u16::from_le_bytes([d[q], d[q + 1]]) as usize
-                };
-                let (a, b, c) = (ix(0), ix(1), ix(2));
-                let (pa, pb, pc) = (p(a), p(b), p(c));
-                let e1 = [pb[0] - pa[0], pb[1] - pa[1], pb[2] - pa[2]];
-                let e2 = [pc[0] - pa[0], pc[1] - pa[1], pc[2] - pa[2]];
-                let n = [
-                    e1[1] * e2[2] - e1[2] * e2[1],
-                    e1[2] * e2[0] - e1[0] * e2[2],
-                    e1[0] * e2[1] - e1[1] * e2[0],
-                ];
-                let len = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt().max(1e-9);
-                let shade = 0.80 + 0.20 * (n[1] / len).abs();
-                for &vi in &[a, b, c] {
-                    let q = col_o + vi * 3;
-                    verts.push(Vertex {
-                        pos: p(vi),
-                        color: [
-                            d[q] as f32 / 255.0 * shade,
-                            d[q + 1] as f32 / 255.0 * shade,
-                            d[q + 2] as f32 / 255.0 * shade,
-                        ],
-                        kind: 1.0,
-                    });
-                }
+            let (a, b, c) = (ix(0), ix(1), ix(2));
+            let (pa, pb, pc) = (p(a), p(b), p(c));
+            let e1 = [pb[0] - pa[0], pb[1] - pa[1], pb[2] - pa[2]];
+            let e2 = [pc[0] - pa[0], pc[1] - pa[1], pc[2] - pa[2]];
+            let n = [
+                e1[1] * e2[2] - e1[2] * e2[1],
+                e1[2] * e2[0] - e1[0] * e2[2],
+                e1[0] * e2[1] - e1[1] * e2[0],
+            ];
+            let len = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt().max(1e-9);
+            let shade = 0.80 + 0.20 * (n[1] / len).abs();
+            for &vi in &[a, b, c] {
+                let q = col_o + vi * 3;
+                verts.push(Vertex {
+                    pos: p(vi),
+                    color: [
+                        d[q] as f32 / 255.0 * shade,
+                        d[q + 1] as f32 / 255.0 * shade,
+                        d[q + 2] as f32 / 255.0 * shade,
+                    ],
+                    kind: 1.0,
+                });
             }
         }
-        FoxModel { verts, per_frame: ni, frames: nf }
-    })
+    }
+    FoxModel { verts, per_frame: ni, frames: nf }
 }
 
 pub const FOX_SCALE: f32 = 1.3;
@@ -575,6 +583,108 @@ pub struct Fox {
     speed: f32,
 }
 
+
+// ------------------------------------------------------------------
+// Grazing bulls beside the road: one alone, or a family (adult + calves), eating animation
+// ------------------------------------------------------------------
+
+#[derive(Clone, Copy)]
+pub struct Bull {
+    pub x: f32,
+    pub y: f32,
+    pub z: f32,
+    pub yaw: f32,
+    pub scale: f32,
+    /// animation phase 0..1 so the herd does not move in sync
+    pub phase: f32,
+}
+
+pub const BULL_ANIM_FPS: f32 = 8.0;
+
+fn bull_compute(iz: i32) -> Vec<Bull> {
+    let mut res = Vec::new();
+    if bull_model().frames == 0 {
+        return res;
+    }
+    let h = hash(iz * 17 + 3, 9091);
+    let r = h % 100;
+    // some stretches: nothing, a single bull, or a family of 3-5
+    let count = if r < 48 { 0 } else if r < 72 { 1 } else { 3 + (h >> 12) as usize % 3 };
+    if count == 0 {
+        return res;
+    }
+    let side: f32 = if (h >> 8) & 1 == 0 { 1.0 } else { -1.0 };
+    let zr = iz as f32 * BLD_CELL + 20.0 + 160.0 * h01(iz, 71);
+    let rp = road_dx(zr);
+    let s = (1.0 + rp * rp).sqrt();
+    let mut off = 18.0 + 10.0 * h01(iz, 72);
+    let base_yaw = 6.283 * h01(iz, 73);
+    // try a few cluster positions until the ground is gentle and free
+    let mut centre = None;
+    for _ in 0..4 {
+        let cx = road_x(zr) + side * off / s;
+        let cz = zr - side * off * rp / s;
+        let (gx, gz) = grad(cx, cz);
+        if (gx * gx + gz * gz).sqrt() < 0.30 && !near_building(cx, cz, 7.0) && mud_amount(cx, cz) < 0.5 {
+            centre = Some((cx, cz));
+            break;
+        }
+        off += 6.0;
+    }
+    let Some((cx, cz)) = centre else { return res };
+    for k in 0..count {
+        let a = 6.283 * h01(iz * 7 + k as i32, 74);
+        let rr = if k == 0 { 0.0 } else { 2.2 + 2.2 * h01(iz * 7 + k as i32, 75) };
+        let x = cx + a.cos() * rr;
+        let z = cz + a.sin() * rr;
+        if near_building(x, z, 5.0) {
+            continue;
+        }
+        let scale = if k == 0 { 1.0 } else { 0.62 + 0.18 * h01(iz * 7 + k as i32, 76) };
+        let yaw = base_yaw + (h01(iz * 7 + k as i32, 77) - 0.5) * 1.4;
+        res.push(Bull { x, y: mesh_h(x, z), z, yaw, scale, phase: h01(iz * 7 + k as i32, 78) });
+    }
+    res
+}
+
+fn bull_cell(iz: i32) -> Vec<Bull> {
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+    thread_local! {
+        static CACHE: RefCell<HashMap<i32, Vec<Bull>>> = RefCell::new(HashMap::new());
+    }
+    CACHE.with(|c| {
+        let mut c = c.borrow_mut();
+        if c.len() > 600 {
+            c.clear();
+        }
+        c.entry(iz).or_insert_with(|| bull_compute(iz)).clone()
+    })
+}
+
+/// All bulls within a few hundred metres (in z) of `z`.
+pub fn bulls_around(z: f32) -> Vec<Bull> {
+    let iz0 = (z / BLD_CELL).floor() as i32;
+    let mut v = Vec::new();
+    for iz in iz0 - 2..=iz0 + 2 {
+        v.extend(bull_cell(iz));
+    }
+    v
+}
+
+fn near_bull(x: f32, z: f32, margin: f32) -> bool {
+    let iz0 = (z / BLD_CELL).floor() as i32;
+    for iz in iz0 - 1..=iz0 + 1 {
+        for b in bull_cell(iz) {
+            let r = 1.6 * b.scale + margin;
+            let (dx, dz) = (x - b.x, z - b.z);
+            if dx * dx + dz * dz < r * r {
+                return true;
+            }
+        }
+    }
+    false
+}
 
 // ------------------------------------------------------------------
 // One-way traffic (4 low-poly car models, shared GPU buffers, one draw per car)
@@ -866,7 +976,7 @@ fn build_flowers(cx: i32, cz: i32, out: &mut Vec<Vertex>) {
             if ((h & 0xff) as f32 / 255.0) > p {
                 continue;
             }
-            if near_building(px, pz, 3.5) || mud_amount(px, pz) > 0.25 {
+            if near_building(px, pz, 3.5) || near_bull(px, pz, 2.5) || mud_amount(px, pz) > 0.25 {
                 continue;
             }
             let col = FLOWER_COLORS[((h >> 24) % 7) as usize];
@@ -1264,6 +1374,7 @@ pub struct Game {
     rng: u32,
     pub fox: Option<Fox>,
     fox_timer: f32,
+    pub time: f32,
 }
 
 impl Game {
@@ -1295,6 +1406,7 @@ impl Game {
             rng,
             fox: None,
             fox_timer: 8.0,
+            time: 0.0,
         }
     }
 
@@ -1390,11 +1502,13 @@ impl Game {
         self.pos.x += self.vel.x * dt;
         self.pos.z += self.vel.z * dt;
 
+        self.time += dt;
         self.update_cars(dt);
         self.update_fox(dt);
         self.rail_collision();
         self.tree_collision();
         self.building_collision();
+        self.bull_collision();
         self.car_collision();
 
         // ---------------- vertical: follow the ground or fly (jumps) ----------------
@@ -1615,6 +1729,30 @@ impl Game {
                     let mut c = new_car(&mut self.rng, zr, lane);
                     c.pitch = 0.0;
                     self.cars[i] = c;
+                }
+            }
+        }
+    }
+
+    /// Bulls are solid (like a tree trunk): the bike stops.
+    fn bull_collision(&mut self) {
+        let iz0 = (self.pos.z / BLD_CELL).floor() as i32;
+        for iz in iz0 - 1..=iz0 + 1 {
+            for b in bull_cell(iz) {
+                let rr = 1.0 * b.scale + 0.45;
+                let (dx, dz) = (self.pos.x - b.x, self.pos.z - b.z);
+                let d2 = dx * dx + dz * dz;
+                if d2 < rr * rr && self.pos.y < b.y + 1.6 * b.scale {
+                    let d = d2.sqrt().max(0.01);
+                    let (nx, nz) = (dx / d, dz / d);
+                    self.pos.x = b.x + nx * rr;
+                    self.pos.z = b.z + nz * rr;
+                    let vn = self.vel.x * nx + self.vel.z * nz;
+                    if vn < 0.0 {
+                        self.vel.x -= vn * nx * 1.3;
+                        self.vel.z -= vn * nz * 1.3;
+                        self.vel = self.vel * 0.6;
+                    }
                 }
             }
         }

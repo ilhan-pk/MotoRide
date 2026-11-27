@@ -41,10 +41,17 @@ fn fs_main(i: VOut) -> @location(0) vec4<f32> {
     return vec4<f32>(mix(col, u.fog.rgb, g), 1.0);
 }
 
-// ---- sky: fullscreen gradient ----
+// ---- sky: 2k equirectangular image ----
+struct SkyU {
+    inv_vp: mat4x4<f32>,
+};
+@group(1) @binding(0) var<uniform> sk: SkyU;
+@group(1) @binding(1) var sky_tex: texture_2d<f32>;
+@group(1) @binding(2) var sky_smp: sampler;
+
 struct SkyOut {
     @builtin(position) pos: vec4<f32>,
-    @location(0) uv: vec2<f32>,
+    @location(0) ndc: vec2<f32>,
 };
 
 @vertex
@@ -56,13 +63,19 @@ fn vs_sky(@builtin(vertex_index) idx: u32) -> SkyOut {
     );
     var o: SkyOut;
     o.pos = vec4<f32>(p[idx], 0.0, 1.0);
-    o.uv = p[idx] * 0.5 + vec2<f32>(0.5, 0.5);
+    o.ndc = p[idx];
     return o;
 }
 
 @fragment
 fn fs_sky(i: SkyOut) -> @location(0) vec4<f32> {
-    let top = vec3<f32>(0.50, 0.90, 1.0);
-    let k = smoothstep(0.5, 1.0, clamp(i.uv.y, 0.0, 1.0));
-    return vec4<f32>(mix(u.fog.rgb, top, k), 1.0);
+    let a = sk.inv_vp * vec4<f32>(i.ndc, 1.0, 1.0);
+    let b = sk.inv_vp * vec4<f32>(i.ndc, 0.0, 1.0);
+    let dir = normalize(a.xyz / a.w - b.xyz / b.w);
+    // sun in the image lines up with the game's light direction
+    let az = atan2(dir.x, dir.z) / 6.2831853 + 0.056;
+    let el = asin(clamp(dir.y, -1.0, 1.0));
+    let uv = vec2<f32>(fract(az), clamp(0.49 - el / 3.14159265, 0.0, 1.0));
+    let c = textureSampleLevel(sky_tex, sky_smp, uv, 0.0).rgb;
+    return vec4<f32>(c, 1.0);
 }

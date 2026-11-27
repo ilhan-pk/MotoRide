@@ -15,8 +15,17 @@ const MAX_HUD_VERTS: usize = 600;
 const MAX_DYN_VERTS: usize = MAX_BALLOON_VERTS + MAX_COCKPIT_VERTS + MAX_HUD_VERTS;
 /// Chunks kept around the player (each side). 4 -> 9 x 9 chunks = 720 m square.
 const R_CHUNKS: i32 = 4;
-const FOG: [f32; 4] = [0.72, 0.96, 0.99, 1.0];
+// matches the horizon colour of the sky image
+const FOG: [f32; 4] = [0.42, 0.69, 0.75, 1.0];
+
+static SKY_PNG: &[u8] = include_bytes!("sky.png");
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct SkyUniforms {
+    inv_vp: [[f32; 4]; 4],
+}
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -44,6 +53,8 @@ pub struct Renderer {
     config: wgpu::SurfaceConfiguration,
     pipeline: wgpu::RenderPipeline,
     sky_pipeline: wgpu::RenderPipeline,
+    sky_ub: wgpu::Buffer,
+    sky_bg: wgpu::BindGroup,
     world_ub: wgpu::Buffer,
     cockpit_ub: wgpu::Buffer,
     hud_ub: wgpu::Buffer,
@@ -169,6 +180,84 @@ impl Renderer {
             push_constant_ranges: &[],
         });
 
+        // ---- sky: 2k equirectangular texture ----
+        let sky_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("sky_bgl"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+        let sky_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("sky_layout"),
+            bind_group_layouts: &[&bgl, &sky_bgl],
+            push_constant_ranges: &[],
+        });
+        let (sky_w, sky_h, sky_rgba) = load_sky();
+        let sky_tex = device.create_texture_with_data(
+            &queue,
+            &wgpu::TextureDescriptor {
+                label: Some("sky"),
+                size: wgpu::Extent3d { width: sky_w, height: sky_h, depth_or_array_layers: 1 },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8Unorm,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            },
+            wgpu::util::TextureDataOrder::LayerMajor,
+            &sky_rgba,
+        );
+        let sky_view = sky_tex.create_view(&Default::default());
+        let sky_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("sky_sampler"),
+            address_mode_u: wgpu::AddressMode::Repeat,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+        let sky_ub = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("sky_ub"),
+            size: std::mem::size_of::<SkyUniforms>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let sky_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("sky_bg"),
+            layout: &sky_bgl,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: sky_ub.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&sky_view) },
+                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&sky_sampler) },
+            ],
+        });
+
         let make_ub = |label| {
             device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some(label),
@@ -241,7 +330,7 @@ impl Renderer {
 
         let sky_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("sky"),
-            layout: Some(&layout),
+            layout: Some(&sky_layout),
             vertex: wgpu::VertexState {
                 module: &shader,
                 entry_point: Some("vs_sky"),
@@ -320,6 +409,8 @@ impl Renderer {
             config,
             pipeline,
             sky_pipeline,
+            sky_ub,
+            sky_bg,
             world_ub,
             cockpit_ub,
             hud_ub,
@@ -511,6 +602,12 @@ impl Renderer {
         let eye = g.eye();
         let f = g.forward();
         let tan_h = 35f32.to_radians().tan() * aspect;
+        self.queue.write_buffer(
+            &self.sky_ub,
+            0,
+            bytemuck::bytes_of(&SkyUniforms { inv_vp: (proj * view).inverse().to_cols_array_2d() }),
+        );
+
         // ---- roadside buildings: one draw each, own uniforms (view-projection * model) ----
         let mut bdraw: Vec<(usize, usize)> = Vec::with_capacity(16);
         for b in buildings_around(eye.z) {
@@ -731,6 +828,7 @@ impl Renderer {
 
             pass.set_pipeline(&self.sky_pipeline);
             pass.set_bind_group(0, &self.world_bg, &[]);
+            pass.set_bind_group(1, &self.sky_bg, &[]);
             pass.draw(0..3, 0..1);
 
             pass.set_pipeline(&self.pipeline);
@@ -789,4 +887,31 @@ impl Renderer {
         self.queue.submit(Some(enc.finish()));
         frame.present();
     }
+}
+
+
+/// Decode the embedded 2k equirectangular sky (PNG) to RGBA8.
+fn load_sky() -> (u32, u32, Vec<u8>) {
+    let decoder = png::Decoder::new(std::io::Cursor::new(SKY_PNG));
+    let mut reader = decoder.read_info().expect("sky png header");
+    let mut buf = vec![0u8; reader.output_buffer_size()];
+    let info = reader.next_frame(&mut buf).expect("sky png data");
+    let (w, h) = (info.width, info.height);
+    let ch = match info.color_type {
+        png::ColorType::Rgba => 4,
+        png::ColorType::Rgb => 3,
+        png::ColorType::GrayscaleAlpha => 2,
+        _ => 1,
+    };
+    let mut rgba = Vec::with_capacity((w * h * 4) as usize);
+    for i in 0..(w * h) as usize {
+        let p = &buf[i * ch..i * ch + ch];
+        match ch {
+            4 => rgba.extend_from_slice(&[p[0], p[1], p[2], 255]),
+            3 => rgba.extend_from_slice(&[p[0], p[1], p[2], 255]),
+            2 => rgba.extend_from_slice(&[p[0], p[0], p[0], 255]),
+            _ => rgba.extend_from_slice(&[p[0], p[0], p[0], 255]),
+        }
+    }
+    (w, h, rgba)
 }

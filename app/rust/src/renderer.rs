@@ -10,7 +10,7 @@ use crate::game::{build_chunk, build_grass, bull_model, bulls_around, buildings_
 use crate::hud;
 
 const MAX_BALLOON_VERTS: usize = 3_000;
-const MAX_COCKPIT_VERTS: usize = 600;
+const MAX_COCKPIT_VERTS: usize = 9000;
 const MAX_HUD_VERTS: usize = 600;
 const MAX_DYN_VERTS: usize = MAX_BALLOON_VERTS + MAX_COCKPIT_VERTS + MAX_HUD_VERTS;
 /// Chunks kept around the player (each side). 4 -> 9 x 9 chunks = 720 m square.

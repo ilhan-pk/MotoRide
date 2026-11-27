@@ -1982,33 +1982,219 @@ impl Game {
         }
     }
 
-    /// Handlebar, stem, red tank and speed bar, in camera space (view = identity).
+    /// First-person cockpit (view = identity): sport-bike bars, mirrors, forks, instrument cluster with a live
+    /// speed arc and a glossy two-tone tank. The static mesh is built once and only transformed per frame.
     pub fn build_cockpit(&self, out: &mut Vec<Vertex>) {
-        let dark = [0.09, 0.10, 0.11];
-        let red = [0.72, 0.23, 0.20];
+        let v3 = Vec3::new;
+        thread_local! {
+            static STATIC: (Vec<Vertex>, Vec<Vertex>) = {
+                let mut bars = Vec::with_capacity(3000);
+                cockpit_bars(&mut bars);
+                let mut tank = Vec::with_capacity(3000);
+                cockpit_tank(&mut tank);
+                (bars, tank)
+            };
+        }
         // the bars move against the rider's head: lean, weight shift and suspension travel
         let sx = -self.rider[0] * 0.6;
         let sy = -(self.rider[1] + self.susp * 0.5) * 0.6;
         let sz = self.rider[2] * 0.6;
-        let base = Mat4::from_translation(Vec3::new(sx, -0.40 + sy, -1.1 + sz))
+        let base = Mat4::from_translation(v3(sx, -0.40 + sy, -1.1 + sz))
             * Mat4::from_rotation_z(-self.rider[0] * 0.25)
             * Mat4::from_rotation_y(-self.steer * 0.35)
             * Mat4::from_rotation_x(0.25);
-        push_box(out, base, Vec3::ZERO, Vec3::new(0.55, 0.03, 0.035), dark); // bar
-        push_box(out, base, Vec3::new(0.0, -0.13, 0.0), Vec3::new(0.04, 0.13, 0.04), dark); // stem
+        STATIC.with(|(bars, tank)| {
+            for q in bars.iter() {
+                out.push(Vertex { pos: base.transform_point3(v3(q.pos[0], q.pos[1], q.pos[2])).to_array(), color: q.color, kind: 1.0 });
+            }
+            out.extend_from_slice(tank);
+        });
 
-        let tank = Mat4::from_translation(Vec3::new(0.0, -0.64, -1.15)) * Mat4::from_rotation_x(0.12);
-        push_box(out, tank, Vec3::ZERO, Vec3::new(0.38, 0.05, 0.55), red);
-
-        let w = 0.01 + 0.36 * (self.speed / MAX_SPEED).min(1.0);
-        push_box(
+        // live speed arc + needle (the only per-frame geometry)
+        let frac = (self.speed / MAX_SPEED).clamp(0.0, 1.0);
+        let c = v3(0.0, 0.058, -0.092);
+        let pol = |a: f32, r: f32, z: f32| v3(c.x + a.cos() * r, c.y + a.sin() * r, c.z + z);
+        let a0 = 225f32.to_radians();
+        let sweep = 270f32.to_radians();
+        let n_seg = 22;
+        for i in 0..n_seg {
+            let t0 = a0 - sweep * i as f32 / n_seg as f32;
+            let t1 = a0 - sweep * (i as f32 + 0.8) / n_seg as f32;
+            let on = (i as f32) < frac * n_seg as f32;
+            let k = i as f32 / n_seg as f32;
+            let col = if !on {
+                [0.08, 0.10, 0.15]
+            } else if k < 0.55 {
+                [0.20, 0.95, 0.45]
+            } else if k < 0.8 {
+                [1.0, 0.82, 0.15]
+            } else {
+                [1.0, 0.25, 0.15]
+            };
+            push_quad_m(out, base, [pol(t0, 0.060, 0.002), pol(t1, 0.060, 0.002), pol(t1, 0.078, 0.002), pol(t0, 0.078, 0.002)], col);
+        }
+        let na = a0 - sweep * frac;
+        let (nx, ny) = (na.cos(), na.sin());
+        let (px, py) = (-ny * 0.004, nx * 0.004);
+        push_quad_m(
             out,
-            tank,
-            Vec3::new(-0.36 + w, 0.06, 0.25),
-            Vec3::new(w, 0.008, 0.012),
-            [0.2, 0.9, 0.3],
+            base,
+            [v3(c.x + px, c.y + py, c.z + 0.004), v3(c.x - px, c.y - py, c.z + 0.004), v3(c.x + nx * 0.060 - px * 0.3, c.y + ny * 0.060 - py * 0.3, c.z + 0.004), v3(c.x + nx * 0.060 + px * 0.3, c.y + ny * 0.060 + py * 0.3, c.z + 0.004)],
+            [1.0, 0.18, 0.12],
         );
     }
+}
+
+/// Everything attached to the handlebar, in bar-local space (no hands).
+fn cockpit_bars(out: &mut Vec<Vertex>) {
+    let metal = [0.20, 0.21, 0.24];
+    let chrome = [0.78, 0.80, 0.84];
+    let rubber = [0.05, 0.05, 0.055];
+    let red = [0.70, 0.06, 0.09];
+    let gold = [0.90, 0.68, 0.16];
+    let v3 = Vec3::new;
+    let m = Mat4::IDENTITY;
+
+    let bar = [v3(-0.57, -0.02, 0.11), v3(-0.40, 0.0, 0.03), v3(-0.20, 0.0, 0.0), v3(0.20, 0.0, 0.0), v3(0.40, 0.0, 0.03), v3(0.57, -0.02, 0.11)];
+    for w in bar.windows(2) {
+        push_tube(out, m, w[0], w[1], 0.016, 0.016, metal, 0.7, 8);
+    }
+    for s in [-1.0f32, 1.0] {
+        // grip with chrome bar-end weight
+        push_tube(out, m, v3(s * 0.36, 0.0, 0.035), v3(s * 0.57, -0.02, 0.11), 0.029, 0.029, rubber, 0.15, 8);
+        push_ell(out, m, v3(s * 0.58, -0.02, 0.115), v3(0.026, 0.026, 0.026), chrome, 1.0, 8, 5);
+        // clamp + switch block
+        push_ell(out, m, v3(s * 0.31, 0.0, 0.0), v3(0.045, 0.032, 0.04), chrome, 0.9, 8, 5);
+        push_ell(out, m, v3(s * 0.27, 0.025, 0.03), v3(0.05, 0.022, 0.03), [0.06, 0.06, 0.07], 0.5, 8, 4);
+        // lever
+        push_tube(out, m, v3(s * 0.40, -0.005, 0.0), v3(s * 0.33, -0.03, -0.24), 0.010, 0.006, chrome, 0.9, 6);
+        // mirror
+        push_tube(out, m, v3(s * 0.31, 0.01, -0.03), v3(s * 0.45, 0.17, -0.07), 0.007, 0.006, rubber, 0.3, 6);
+        push_ell(out, m, v3(s * 0.46, 0.18, -0.08), v3(0.07, 0.046, 0.024), red, 1.0, 10, 6);
+        push_ell(out, m, v3(s * 0.46, 0.18, -0.059), v3(0.058, 0.036, 0.005), [0.55, 0.76, 0.92], 1.0, 9, 4);
+        // fork leg: chrome upper tube, gold lower slider
+        push_tube(out, m, v3(s * 0.12, -0.05, -0.03), v3(s * 0.13, -0.30, -0.12), 0.024, 0.024, chrome, 1.0, 8);
+        push_tube(out, m, v3(s * 0.13, -0.30, -0.12), v3(s * 0.145, -0.62, -0.25), 0.03, 0.03, gold, 0.9, 8);
+        // fairing side panel
+        push_ell(out, m, v3(s * 0.25, -0.02, -0.25), v3(0.07, 0.075, 0.22), red, 1.0, 10, 6);
+    }
+    // brake fluid reservoir (right) and triple clamp
+    push_ell(out, m, v3(0.26, 0.055, 0.0), v3(0.02, 0.025, 0.02), [0.85, 0.85, 0.9], 1.0, 8, 4);
+    push_ell(out, m, v3(0.0, -0.045, -0.02), v3(0.17, 0.026, 0.06), chrome, 1.0, 10, 5);
+
+    // instrument cluster housing, dial face, ring and tick marks
+    push_ell(out, m, v3(0.0, 0.055, -0.15), v3(0.125, 0.075, 0.055), [0.05, 0.05, 0.06], 0.6, 12, 7);
+    let c = v3(0.0, 0.058, -0.092);
+    let pol = |a: f32, r: f32, z: f32| v3(c.x + a.cos() * r, c.y + a.sin() * r, c.z + z);
+    let n_face = 24;
+    for i in 0..n_face {
+        let t0 = std::f32::consts::TAU * i as f32 / n_face as f32;
+        let t1 = std::f32::consts::TAU * (i + 1) as f32 / n_face as f32;
+        push_tri_m(out, m, [c, pol(t0, 0.088, 0.0), pol(t1, 0.088, 0.0)], [0.02, 0.04, 0.09]);
+        push_quad_m(out, m, [pol(t0, 0.088, 0.001), pol(t1, 0.088, 0.001), pol(t1, 0.098, 0.001), pol(t0, 0.098, 0.001)], [0.70, 0.86, 1.0]);
+    }
+    let a0 = 225f32.to_radians();
+    let sweep = 270f32.to_radians();
+    for i in 0..=10 {
+        let t = a0 - sweep * i as f32 / 10.0;
+        let w = 0.004;
+        push_quad_m(out, m, [pol(t - w, 0.080, 0.002), pol(t + w, 0.080, 0.002), pol(t + w, 0.087, 0.002), pol(t - w, 0.087, 0.002)], [0.85, 0.92, 1.0]);
+    }
+    push_ell(out, m, v3(c.x, c.y, c.z + 0.004), v3(0.012, 0.012, 0.006), chrome, 1.0, 8, 4);
+}
+
+/// Tank in camera space: deep metallic red, white racing stripe, chrome filler cap, knee pads.
+fn cockpit_tank(out: &mut Vec<Vertex>) {
+    let v3 = Vec3::new;
+    let tank = Mat4::from_translation(v3(0.0, -0.56, -1.0)) * Mat4::from_rotation_x(0.12);
+    push_tank(out, tank, v3(0.26, 0.14, 0.55), [0.70, 0.06, 0.09], [0.95, 0.95, 0.97]);
+    push_ell(out, tank, v3(0.0, 0.135, 0.03), v3(0.055, 0.016, 0.055), [0.78, 0.80, 0.84], 1.0, 12, 3);
+    push_ell(out, tank, v3(0.0, 0.147, 0.03), v3(0.025, 0.008, 0.025), [0.1, 0.1, 0.1], 0.6, 8, 3);
+    for s in [-1.0f32, 1.0] {
+        push_ell(out, tank, v3(s * 0.235, -0.01, 0.12), v3(0.03, 0.09, 0.2), [0.05, 0.05, 0.055], 0.1, 8, 4);
+    }
+}
+
+fn shade_col(n: Vec3, base: [f32; 3], gloss: f32) -> [f32; 3] {
+    let l = Vec3::new(-0.35, 0.8, 0.5).normalize();
+    let h = (l + Vec3::new(0.0, 0.0, 1.0)).normalize();
+    let d = n.dot(l).max(0.0);
+    let sp = n.dot(h).max(0.0).powf(26.0) * gloss * 0.9;
+    let s = 0.36 + 0.64 * d;
+    [(base[0] * s + sp).min(1.0), (base[1] * s + sp).min(1.0), (base[2] * s + sp).min(1.0)]
+}
+
+fn xf_dir(m: Mat4, d: Vec3) -> Vec3 {
+    let o = m.transform_point3(Vec3::ZERO);
+    (m.transform_point3(d) - o).normalize()
+}
+
+/// Smooth-shaded ellipsoid.
+fn push_ell(out: &mut Vec<Vertex>, m: Mat4, c: Vec3, r: Vec3, color: [f32; 3], gloss: f32, seg: usize, rings: usize) {
+    let pt = |i: usize, j: usize| -> Vertex {
+        let th = std::f32::consts::PI * i as f32 / rings as f32;
+        let ph = std::f32::consts::TAU * j as f32 / seg as f32;
+        let d = Vec3::new(ph.cos() * th.sin(), th.cos(), ph.sin() * th.sin());
+        let p = m.transform_point3(c + Vec3::new(d.x * r.x, d.y * r.y, d.z * r.z));
+        let n = xf_dir(m, Vec3::new(d.x / r.x, d.y / r.y, d.z / r.z));
+        Vertex { pos: p.to_array(), color: shade_col(n, color, gloss), kind: 1.0 }
+    };
+    for i in 0..rings {
+        for j in 0..seg {
+            let (a, b, cc, d) = (pt(i, j), pt(i, j + 1), pt(i + 1, j + 1), pt(i + 1, j));
+            out.extend_from_slice(&[a, b, cc, a, cc, d]);
+        }
+    }
+}
+
+/// Glossy tank ellipsoid with a painted racing stripe (per-vertex colours, no overlapping geometry).
+fn push_tank(out: &mut Vec<Vertex>, m: Mat4, r: Vec3, body: [f32; 3], stripe: [f32; 3]) {
+    let (seg, rings) = (32usize, 12usize);
+    let pt = |i: usize, j: usize| -> Vertex {
+        let th = std::f32::consts::PI * i as f32 / rings as f32;
+        let ph = std::f32::consts::TAU * j as f32 / seg as f32;
+        let d = Vec3::new(ph.cos() * th.sin(), th.cos(), ph.sin() * th.sin());
+        let p = m.transform_point3(Vec3::new(d.x * r.x, d.y * r.y, d.z * r.z));
+        let n = xf_dir(m, Vec3::new(d.x / r.x, d.y / r.y, d.z / r.z));
+        let on = d.y > 0.45 && (d.x * r.x).abs() < 0.032;
+        Vertex { pos: p.to_array(), color: shade_col(n, if on { stripe } else { body }, 1.0), kind: 1.0 }
+    };
+    for i in 0..rings {
+        for j in 0..seg {
+            let (a, b, cc, d) = (pt(i, j), pt(i, j + 1), pt(i + 1, j + 1), pt(i + 1, j));
+            out.extend_from_slice(&[a, b, cc, a, cc, d]);
+        }
+    }
+}
+
+/// Smooth-shaded tapered tube from a to b (in m space).
+fn push_tube(out: &mut Vec<Vertex>, m: Mat4, a: Vec3, b: Vec3, r0: f32, r1: f32, color: [f32; 3], gloss: f32, seg: usize) {
+    let ax = (b - a).normalize();
+    let helper = if ax.y.abs() < 0.9 { Vec3::Y } else { Vec3::new(1.0, 0.0, 0.0) };
+    let u = ax.cross(helper).normalize();
+    let w = ax.cross(u);
+    let ring = |t: f32, j: usize| -> Vertex {
+        let ph = std::f32::consts::TAU * j as f32 / seg as f32;
+        let d = u * ph.cos() + w * ph.sin();
+        let (p, r) = if t < 0.5 { (a, r0) } else { (b, r1) };
+        let pos = m.transform_point3(p + d * r);
+        Vertex { pos: pos.to_array(), color: shade_col(xf_dir(m, d), color, gloss), kind: 1.0 }
+    };
+    for j in 0..seg {
+        let (p0, p1, q0, q1) = (ring(0.0, j), ring(0.0, j + 1), ring(1.0, j), ring(1.0, j + 1));
+        out.extend_from_slice(&[p0, p1, q1, p0, q1, q0]);
+    }
+}
+
+fn push_tri_m(out: &mut Vec<Vertex>, m: Mat4, p: [Vec3; 3], color: [f32; 3]) {
+    for q in p.iter() {
+        out.push(Vertex { pos: m.transform_point3(*q).to_array(), color, kind: 1.0 });
+    }
+}
+
+fn push_quad_m(out: &mut Vec<Vertex>, m: Mat4, p: [Vec3; 4], color: [f32; 3]) {
+    push_tri_m(out, m, [p[0], p[1], p[2]], color);
+    push_tri_m(out, m, [p[0], p[2], p[3]], color);
 }
 
 pub fn push_box(out: &mut Vec<Vertex>, m: Mat4, c: Vec3, h: Vec3, color: [f32; 3]) {

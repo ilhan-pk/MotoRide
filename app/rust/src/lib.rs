@@ -1,3 +1,4 @@
+mod audio;
 mod game;
 mod hud;
 mod renderer;
@@ -33,6 +34,7 @@ struct App {
     fps_frames: u32,
     fps_time: f32,
     fps: u32,
+    audio: Option<audio::AudioOut>,
 }
 
 impl App {
@@ -47,6 +49,7 @@ impl App {
             fps_frames: 0,
             fps_time: 0.0,
             fps: 0,
+            audio: None,
         }
     }
 
@@ -106,12 +109,16 @@ impl ApplicationHandler for App {
         self.renderer = Some(r);
         self.window = Some(window);
         self.last = Instant::now();
+        if self.audio.is_none() {
+            self.audio = Some(audio::AudioOut::start());
+        }
     }
 
     fn suspended(&mut self, _event_loop: &ActiveEventLoop) {
         // Android destroys the surface here; recreate in resumed().
         self.renderer = None;
         self.window = None;
+        self.audio = None; // silence while the app is in the background
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
@@ -138,6 +145,7 @@ impl ApplicationHandler for App {
                 }
 
                 self.game.update(&self.input, dt);
+                audio::set_state(self.game.speed, self.input.throttle);
                 if let Some(r) = &mut self.renderer {
                     r.render(&self.game, self.fps);
                 }

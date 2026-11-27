@@ -36,6 +36,7 @@ val cargoNdkBuild by tasks.registering(Exec::class) {
     onlyIf { hasCargo }
     workingDir = file("rust")
     val cmd = mutableListOf("cargo", "ndk")
+    cmd += listOf("--platform", "26") // AAudio (engine sound) needs API 26+
     listOf("arm64-v8a", "armeabi-v7a", "x86_64").forEach { cmd += listOf("-t", it) }
     cmd += listOf("-o", jniDir.absolutePath, "build", "--release", "--lib")
     commandLine(cmd)

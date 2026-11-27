@@ -19,38 +19,93 @@ fn state() -> (f32, f32) {
 
 /// Top speed (m/s) of each of the five gears.
 const GEARS: [f32; 5] = [9.0, 16.0, 24.0, 34.0, 50.0];
-const IDLE_RPM: f32 = 945.0;
-const MAX_RPM: f32 = 4200.0;
+const IDLE_RPM: f32 = 850.0; // lazy thumper idle: dug . . dug . . dug
+const MAX_RPM: f32 = 4300.0;
 
-/// Seamless loops cut from a real Royal Enfield Bullet 350 recording, each tagged with the rpm it was recorded at.
-const LOOP_RPM: [f32; 3] = [945.0, 2105.0, 2727.0];
-static LOOP_DATA: [&[u8]; 3] = [include_bytes!("eng0.bin"), include_bytes!("eng1.bin"), include_bytes!("eng2.bin")];
-
+/// Physical-model Bullet: each firing is a short pressure pulse that rings in a long, damped exhaust pipe
+/// (the deep "dug"), plus a sharp combustion crack ("tuk"), valve ticks and a block thump. Because the pipe
+/// resonates at a fixed pitch, revving only changes the *rate* of the beats, never the tone (no tape-speed
+/// squeak), exactly like the real engine.
 pub struct Engine {
     sr: f32,
-    loops: Vec<Vec<f32>>,
-    pos: [f32; 3],
     rpm: f32,
     thr: f32,
-    nl: f32,
+    fire: f32,
+    e1: f32,
+    e2: f32,
+    pipe1: Vec<f32>,
+    pipe2: Vec<f32>,
+    i1: usize,
+    i2: usize,
+    lp1: f32,
+    lp2: f32,
+    crack: f32,
+    nlp: f32,
+    nprev: f32,
+    tick: f32,
+    thump: f32,
+    tph: f32,
+    body_lp: f32,
     wind: f32,
+    out_lp: f32,
+    amp: f32,
+    modes: [[f32; 2]; 4], // resonator states (body / muffler shell modes)
+    hunt: f32,
+    nlp2: f32,
+    road: f32,
+    rev: [Vec<f32>; 3],
+    ri: [usize; 3],
+    rlp: [f32; 3],
     rng: u32,
 }
 
 impl Engine {
     pub fn new(sr: f32) -> Self {
-        let loops = LOOP_DATA
-            .iter()
-            .map(|d| d.chunks_exact(2).map(|b| i16::from_le_bytes([b[0], b[1]]) as f32 / 32768.0).collect())
-            .collect();
-        Self { sr, loops, pos: [0.0, 123.0, 457.0], rpm: IDLE_RPM, thr: 0.0, nl: 0.0, wind: 0.0, rng: 0x1234_5678 }
+        let d1 = (2.0 * 0.95 / 343.0 * sr) as usize; // main pipe, quarter-wave ~90 Hz
+        let d2 = (2.0 * 0.36 / 343.0 * sr) as usize; // header, ~240 Hz
+        Self {
+            sr,
+            rpm: IDLE_RPM,
+            thr: 0.0,
+            fire: 0.9,
+            e1: 0.0,
+            e2: 0.0,
+            pipe1: vec![0.0; d1],
+            pipe2: vec![0.0; d2],
+            i1: 0,
+            i2: 0,
+            lp1: 0.0,
+            lp2: 0.0,
+            crack: 0.0,
+            nlp: 0.0,
+            nprev: 0.0,
+            tick: 0.0,
+            thump: 0.0,
+            tph: 0.0,
+            body_lp: 0.0,
+            wind: 0.0,
+            out_lp: 0.0,
+            amp: 0.6,
+            modes: [[0.0; 2]; 4],
+            hunt: 0.0,
+            nlp2: 0.0,
+            road: 0.0,
+            rev: [vec![0.0; (sr * 0.0297) as usize], vec![0.0; (sr * 0.0437) as usize], vec![0.0; (sr * 0.0713) as usize]],
+            ri: [0; 3],
+            rlp: [0.0; 3],
+            rng: 0x1234_5678
+        }
     }
 
-    fn noise(&mut self) -> f32 {
+    fn rand(&mut self) -> u32 {
         self.rng ^= self.rng << 13;
         self.rng ^= self.rng >> 17;
         self.rng ^= self.rng << 5;
-        (self.rng >> 8) as f32 / 8_388_608.0 - 1.0
+        self.rng
+    }
+
+    fn noise(&mut self) -> f32 {
+        (self.rand() >> 8) as f32 / 8_388_608.0 - 1.0
     }
 
     /// Fill `out` (mono, -1..1) for the given bike state.
@@ -61,70 +116,149 @@ impl Engine {
         while g < 4 && speed > GEARS[g] {
             g += 1;
         }
-        let mut target = IDLE_RPM + (MAX_RPM - 1100.0) * (speed / GEARS[g]).min(1.0) * 0.95;
+        let mut target = IDLE_RPM + (MAX_RPM - 1000.0) * (speed / GEARS[g]).min(1.0) * 0.95;
         if speed < 1.5 && throttle > 0.5 {
-            target = 2400.0; // revving on the spot
+            target = 2800.0; // revving on the spot
         } else {
-            target += throttle * 400.0;
+            target += throttle * 300.0;
         }
-        let k = 1.0 - (-dt * if target > self.rpm { 5.0 } else { 3.0 }).exp();
+        let k = 1.0 - (-dt * if target > self.rpm { 4.5 } else { 2.5 }).exp();
         self.rpm += (target - self.rpm) * k;
         self.rpm = self.rpm.clamp(IDLE_RPM, MAX_RPM);
-        self.thr += (throttle - self.thr) * (1.0 - (-dt * 6.0).exp());
+        self.thr += (throttle - self.thr) * (1.0 - (-dt * 7.0).exp());
 
-        // crossfade (equal power) between the two loops whose rpm brackets the engine rpm
-        let r = self.rpm;
-        let (i0, i1, f) = if r <= LOOP_RPM[0] {
-            (0, 0, 0.0)
-        } else if r >= LOOP_RPM[2] {
-            (2, 2, 0.0)
-        } else if r < LOOP_RPM[1] {
-            (0, 1, (r - LOOP_RPM[0]) / (LOOP_RPM[1] - LOOP_RPM[0]))
-        } else {
-            (1, 2, (r - LOOP_RPM[1]) / (LOOP_RPM[2] - LOOP_RPM[1]))
-        };
-        let (w0, w1) = ((f * std::f32::consts::FRAC_PI_2).cos(), (f * std::f32::consts::FRAC_PI_2).sin());
-        let (r0, r1) = (r / LOOP_RPM[i0], r / LOOP_RPM[i1]);
-        // louder on the throttle, a bit softer on the overrun; a touch louder as the revs climb
-        let level = (0.62 + 0.30 * self.thr) * (0.85 + 0.15 * (r - IDLE_RPM) / (MAX_RPM - IDLE_RPM));
+        let rn = (self.rpm - IDLE_RPM) / (MAX_RPM - IDLE_RPM);
+        // the heavy flywheel makes the idle "hunt" slowly: revs wander a few percent
+        self.hunt += dt * 5.6;
+        let wander = (self.hunt.sin() * 0.022 + (self.hunt * 0.37).sin() * 0.015) * (1.0 - rn);
+        let f_fire = self.rpm * (1.0 + wander) / 120.0; // one firing per two crank turns
+        let sr = self.sr;
+        let d_pulse_slow = (-1.0 / (sr * 0.0035)).exp();
+        let d_pulse_fast = (-1.0 / (sr * 0.0008)).exp();
+        let d_crack = (-1.0 / (sr * 0.0045)).exp();
+        let d_tick = (-1.0 / (sr * 0.0015)).exp();
+        let d_thump = (-1.0 / (sr * 0.028)).exp();
         let wind_amp = (speed / 40.0).min(1.0);
+        let g1 = 0.80 - 0.10 * rn; // exhaust rings less at high revs
+        let g2 = 0.55;
 
-        let (l0, l1) = (self.loops[i0].len(), self.loops[i1].len());
-        let (mut p0, mut p1) = (self.pos[i0], self.pos[i1]);
         for o in out.iter_mut() {
-            let mut s = 0.0;
-            if w0 > 0.001 {
-                s += w0 * sample(&self.loops[i0], p0);
+            let prev_fire = self.fire;
+            self.fire += f_fire / sr;
+            let mut fired = false;
+            if self.fire >= 1.0 {
+                self.fire -= 1.0;
+                fired = true;
             }
-            if i1 != i0 && w1 > 0.001 {
-                s += w1 * sample(&self.loops[i1], p1);
+            // valve gear ticks at the firing point and half a cycle later
+            if (prev_fire < 0.5 && self.fire >= 0.5) || fired {
+                self.tick = 1.0;
             }
-            p0 += r0;
-            if p0 >= l0 as f32 {
-                p0 -= l0 as f32;
+            if fired {
+                // lumpy single-cylinder combustion: every firing a little different, a weak one now and then at idle
+                let r = (self.rand() >> 8) as f32 / 16_777_216.0;
+                let mut a = (0.50 + 0.50 * self.thr) * (0.80 + 0.40 * r);
+                if rn < 0.2 && (self.rand() % 100) < 5 {
+                    a *= 0.35;
+                }
+                // overrun pop: closed throttle at higher revs now and then bangs in the exhaust
+                if self.thr < 0.15 && rn > 0.25 && (self.rand() % 100) < 30 {
+                    a = 0.9 + 0.6 * r;
+                    self.crack = 1.4;
+                } else {
+                    self.crack = a * 1.1;
+                }
+                self.e1 += a;
+                self.e2 += a;
+                self.thump = a;
+                // slight timing jitter from the heavy flywheel
+                self.fire -= (self.noise() * 0.5 + 0.5) * 0.04;
             }
-            p1 += r1;
-            if p1 >= l1 as f32 {
-                p1 -= l1 as f32;
-            }
-            let n = self.noise();
-            self.wind += (n - self.wind) * 0.04;
-            let y = s * level + self.wind * wind_amp * 0.30;
-            *o = (y * 1.1).tanh() * 0.9;
-        }
-        self.pos[i0] = p0;
-        self.pos[i1] = p1;
-        let _ = self.nl;
-    }
-}
+            // exhaust pressure pulse: fast attack, slower decay
+            self.e1 *= d_pulse_slow;
+            self.e2 *= d_pulse_fast;
+            let pulse = self.e1 - self.e2;
 
-#[inline]
-fn sample(buf: &[f32], p: f32) -> f32 {
-    let i = p as usize;
-    let f = p - i as f32;
-    let a = buf[i];
-    let b = buf[if i + 1 >= buf.len() { 0 } else { i + 1 }];
-    a + (b - a) * f
+            // main pipe: quarter-wave resonator (open end inverts), damped by the muffler
+            let b1 = self.pipe1[self.i1];
+            self.lp1 += (b1 - self.lp1) * 0.30;
+            let p1 = pulse - g1 * self.lp1;
+            self.pipe1[self.i1] = p1;
+            self.i1 += 1;
+            if self.i1 >= self.pipe1.len() {
+                self.i1 = 0;
+            }
+            // header pipe
+            let b2 = self.pipe2[self.i2];
+            self.lp2 += (b2 - self.lp2) * 0.45;
+            let p2 = pulse - g2 * self.lp2;
+            self.pipe2[self.i2] = p2;
+            self.i2 += 1;
+            if self.i2 >= self.pipe2.len() {
+                self.i2 = 0;
+            }
+            let exhaust = 0.55 * p1 + 0.30 * p2;
+
+            let n = self.noise();
+            self.nlp += (n - self.nlp) * 0.18;
+            let hp = self.nlp - self.nprev * 0.0; // band-limited noise for the crack
+            let crack = (n - self.nlp) * 0.6 + hp * 0.4;
+            let ck = crack * self.crack * 0.55;
+            self.crack *= d_crack;
+            let dn = n - self.nprev;
+            self.nprev = n;
+            let tick = dn * self.tick * 0.05;
+            self.tick *= d_tick;
+
+            self.tph += (46.0 + 12.0 * rn) / sr;
+            if self.tph >= 1.0 {
+                self.tph -= 1.0;
+            }
+            let thump = (self.tph * std::f32::consts::TAU).sin() * self.thump * 0.55;
+            self.thump *= d_thump;
+
+            self.wind += (n - self.wind) * 0.04;
+            let wind = self.wind * wind_amp * 0.35;
+
+            // body / muffler shell modes ring after every pulse: the "dwoom" body of the thump
+            const MODE: [(f32, f32, f32); 4] = [(66.0, 0.085, 0.55), (112.0, 0.060, 0.40), (186.0, 0.040, 0.28), (305.0, 0.025, 0.16)];
+            let mut modal = 0.0;
+            for (m, &(fq, tau, gain)) in self.modes.iter_mut().zip(MODE.iter()) {
+                let r = (-1.0 / (sr * tau)).exp();
+                let c = 2.0 * r * (std::f32::consts::TAU * fq / sr).cos();
+                let y0 = pulse * (1.0 - r) * 0.30 + c * m[0] - r * r * m[1];
+                m[1] = m[0];
+                m[0] = y0;
+                modal += y0 * gain;
+            }
+            // intake chuff: low rumbling noise swelling with each pulse, stronger on the throttle
+            self.nlp2 += (n - self.nlp2) * 0.07;
+            let intake = self.nlp2 * pulse.abs() * (0.25 + 0.9 * self.thr) * 1.6;
+            // tyre / road rumble with speed
+            self.road += (n - self.road) * 0.015;
+            let road = self.road * wind_amp * 0.5;
+
+            let mix = exhaust * 1.0 + modal * 0.9 + ck + tick + thump + intake;
+            let dry = (mix * 1.25).tanh() * 0.78;
+            // small room / garage reverb for depth
+            let mut wet = 0.0;
+            for i in 0..3 {
+                let o = self.rev[i][self.ri[i]];
+                self.rlp[i] += (o - self.rlp[i]) * 0.35;
+                self.rev[i][self.ri[i]] = dry + 0.42 * self.rlp[i];
+                self.ri[i] += 1;
+                if self.ri[i] >= self.rev[i].len() {
+                    self.ri[i] = 0;
+                }
+                wet += o;
+            }
+            let y = dry + wet * 0.10 + wind + road;
+            self.out_lp += (y - self.out_lp) * 0.75;
+            // quiet idle would vanish on a phone speaker: lift it, and leave headroom when revving
+            *o = (self.out_lp * (0.80 + 0.9 * (1.0 - rn) * (1.0 - rn))).clamp(-0.98, 0.98);
+        }
+        let _ = (self.body_lp, self.amp);
+    }
 }
 
 // ---------------------------------------------------------------------------------------------

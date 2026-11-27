@@ -29,20 +29,20 @@ fn rect(out: &mut Vec<Vertex>, x0: f32, y0: f32, x1: f32, y1: f32, z: f32, c: [f
 /// "FPS nn" in the top-left corner, in clip space (identity view-projection).
 pub fn build_fps(out: &mut Vec<Vertex>, fps: u32, aspect: f32) {
     let text = format!("FPS {}", fps.min(999));
-    let h = 0.085;
+    let h = 0.045;
     let w = h * 0.55 / aspect;
-    let t = h * 0.16; // horizontal bar thickness (y)
+    let t = h * 0.18; // horizontal bar thickness (y)
     let tx = t / aspect; // vertical bar thickness (x)
     let gap = w * 0.45;
-    let x0 = -0.965;
-    let yt = 0.94;
+    let x0 = -0.975;
+    let yt = 0.965;
     let yb = yt - h;
     let ym = yt - h * 0.5;
 
     let chars = text.chars().count() as f32;
     let total = chars * (w + gap) - gap;
-    let pad_x = 0.012 / aspect * 2.0;
-    let pad_y = 0.012;
+    let pad_x = 0.008 / aspect * 2.0;
+    let pad_y = 0.008;
     rect(
         out,
         x0 - pad_x,

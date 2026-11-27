@@ -6,7 +6,7 @@ use glam::{Mat4, Vec3};
 use wgpu::util::{BufferInitDescriptor, DeviceExt};
 use winit::window::Window;
 
-use crate::game::{build_chunk, build_grass, bull_model, bulls_around, buildings_around, car_models, fox_model, models, Game, Vertex, BULL_ANIM_FPS, CHUNK, FOX_SCALE};
+use crate::game::{build_chunk, bull_model, bulls_around, buildings_around, car_models, fox_model, models, Game, Vertex, BULL_ANIM_FPS, CHUNK, FOX_SCALE};
 use crate::hud;
 
 const MAX_BALLOON_VERTS: usize = 3_000;
@@ -42,20 +42,7 @@ struct Chunk {
     born: Instant,
     /// Own uniforms while the spawn animation runs (None once settled).
     anim: Option<(wgpu::Buffer, wgpu::BindGroup)>,
-    /// Grass tufts (only built while the chunk is near the rider).
-    grass: Option<GrassPart>,
-    grass_done: bool,
 }
-
-struct GrassPart {
-    vb: wgpu::Buffer,
-    count: u32,
-    born: Instant,
-    anim: Option<(wgpu::Buffer, wgpu::BindGroup)>,
-}
-
-const GRASS_R: f32 = 85.0;
-const GRASS_GROW_SECS: f32 = 1.2;
 
 const REVEAL_SECS: f32 = 1.4;
 
@@ -521,54 +508,7 @@ impl Renderer {
                 });
                 Some((ub, bg))
             };
-            self.chunks.insert(key, Chunk { vb, count: self.part.len() as u32, born: Instant::now(), anim, grass: None, grass_done: false });
-        }
-    }
-
-    /// Build grass for the nearest chunk that does not have it yet (one per frame); drop it when far away.
-    fn stream_grass(&mut self, g: &Game) {
-        let (px, pz) = (g.pos.x, g.pos.z);
-        let mut best: Option<((i32, i32), f32)> = None;
-        for (k, c) in self.chunks.iter_mut() {
-            let cx = (k.0 as f32 + 0.5) * CHUNK;
-            let cz = (k.1 as f32 + 0.5) * CHUNK;
-            let d = ((cx - px) * (cx - px) + (cz - pz) * (cz - pz)).sqrt();
-            if d > 200.0 {
-                if c.grass.is_some() || c.grass_done {
-                    c.grass = None;
-                    c.grass_done = false;
-                }
-                continue;
-            }
-            if !c.grass_done && d < GRASS_R && best.map_or(true, |b| d < b.1) {
-                best = Some((*k, d));
-            }
-        }
-        let Some((key, _)) = best else { return };
-        self.part.clear();
-        build_grass(key.0, key.1, &mut self.part);
-        if let Some(c) = self.chunks.get_mut(&key) {
-            c.grass_done = true;
-            if self.part.is_empty() {
-                return;
-            }
-            let vb = self.device.create_buffer_init(&BufferInitDescriptor {
-                label: Some("grass"),
-                contents: bytemuck::cast_slice(&self.part),
-                usage: wgpu::BufferUsages::VERTEX,
-            });
-            let ub = self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("grass_ub"),
-                size: std::mem::size_of::<Uniforms>() as u64,
-                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-            let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: None,
-                layout: &self.bgl,
-                entries: &[wgpu::BindGroupEntry { binding: 0, resource: ub.as_entire_binding() }],
-            });
-            c.grass = Some(GrassPart { vb, count: self.part.len() as u32, born: Instant::now(), anim: Some((ub, bg)) });
+            self.chunks.insert(key, Chunk { vb, count: self.part.len() as u32, born: Instant::now(), anim });
         }
     }
 
@@ -603,7 +543,6 @@ impl Renderer {
 
         // ---- static world: built once per chunk, cached on the GPU ----
         self.stream_chunks(g);
-        self.stream_grass(g);
 
         // spawn animation: new chunks rise out of the fog with an ease-out curve
         let world_u = Uniforms {
@@ -612,21 +551,6 @@ impl Renderer {
             params: [1.0 / 240.0, 0.0, g.time % 628.0, 0.0],
         };
         for c in self.chunks.values_mut() {
-            if let Some(gp) = &mut c.grass {
-                if gp.anim.is_some() {
-                    let t = (gp.born.elapsed().as_secs_f32() / GRASS_GROW_SECS).min(1.0);
-                    if t >= 1.0 {
-                        gp.anim = None;
-                    } else {
-                        let e = 1.0 - (1.0 - t) * (1.0 - t);
-                        let mut u = world_u;
-                        u.params[1] = 1.0 - e;
-                        if let Some((ub, _)) = &gp.anim {
-                            self.queue.write_buffer(ub, 0, bytemuck::bytes_of(&u));
-                        }
-                    }
-                }
-            }
             if c.anim.is_none() {
                 continue;
             }
@@ -916,14 +840,6 @@ impl Renderer {
                 }
                 pass.set_vertex_buffer(0, c.vb.slice(..));
                 pass.draw(0..c.count, 0..1);
-                if let Some(gp) = &c.grass {
-                    match &gp.anim {
-                        Some((_, bg)) => pass.set_bind_group(0, bg, &[]),
-                        None => pass.set_bind_group(0, &self.world_bg, &[]),
-                    }
-                    pass.set_vertex_buffer(0, gp.vb.slice(..));
-                    pass.draw(0..gp.count, 0..1);
-                }
             }
 
             for &(m, i) in bdraw.iter() {

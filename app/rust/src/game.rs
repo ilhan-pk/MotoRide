@@ -2248,7 +2248,8 @@ impl Game {
         let sd = (1.0 + tdx * tdx).sqrt();
         let lat = (self.pos.x - trail_x(z, &zn)) / sd;
         const LIM: f32 = 2.85;
-        if lat.abs() > LIM {
+        // only while actually on / right beside the deck (never drag a bike riding the main road)
+        if lat.abs() > LIM && lat.abs() < 4.6 {
             let sgn = lat.signum();
             self.pos.x = trail_x(z, &zn) + sgn * LIM * sd;
             let n = Vec3::new(1.0, 0.0, -tdx) / sd * sgn;

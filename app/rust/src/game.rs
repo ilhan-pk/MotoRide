@@ -857,7 +857,7 @@ pub struct Bld {
 
 const BLD_CELL: f32 = 200.0;
 /// Which local axis is the facade of each model (true = +x, false = +z).
-const FRONT_X: [bool; 8] = [true, true, false, false, false, false, false, false];
+const FRONT_X: [bool; 9] = [true, true, false, false, false, false, false, false, false];
 
 fn bld_compute(iz: i32) -> Vec<Bld> {
     let ms = models();

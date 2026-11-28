@@ -1,4 +1,5 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -15,6 +16,8 @@ const MAX_HUD_VERTS: usize = 600;
 const MAX_DYN_VERTS: usize = MAX_BALLOON_VERTS + MAX_COCKPIT_VERTS + MAX_HUD_VERTS;
 /// Chunks kept around the player (each side). 4 -> 9 x 9 chunks = 720 m square.
 const R_CHUNKS: i32 = 4;
+/// Smallest draw distance the adaptive quality may fall back to.
+const R_MIN: i32 = 2;
 // matches the horizon colour of the sky image
 const FOG: [f32; 4] = [0.42, 0.69, 0.75, 1.0];
 
@@ -64,6 +67,13 @@ pub struct Renderer {
     /// Small per-frame buffer: [balloons | cockpit | hud].
     dyn_vb: wgpu::Buffer,
     chunks: HashMap<(i32, i32), Chunk>,
+    tx: Sender<(i32, i32)>,
+    rx: Receiver<((i32, i32), Vec<Vertex>)>,
+    pending: HashSet<(i32, i32)>,
+    view_r: i32,
+    adapt_t: Instant,
+    low_s: f32,
+    high_s: f32,
     depth_view: wgpu::TextureView,
     batch: Vec<Vertex>,
     part: Vec<Vertex>,
@@ -402,6 +412,20 @@ impl Renderer {
             })
             .collect();
 
+        // background chunk builder: requests in, finished meshes out
+        let (tx, rx_req) = channel::<(i32, i32)>();
+        let (tx_res, rx) = channel::<((i32, i32), Vec<Vertex>)>();
+        let _ = std::thread::Builder::new().name("chunks".into()).spawn(move || {
+            let mut v: Vec<Vertex> = Vec::with_capacity(8_000);
+            while let Ok(k) = rx_req.recv() {
+                v.clear();
+                build_chunk(k.0, k.1, &mut v);
+                if tx_res.send((k, v.clone())).is_err() {
+                    break;
+                }
+            }
+        });
+
         Self {
             surface,
             device,
@@ -419,6 +443,13 @@ impl Renderer {
             hud_bg,
             dyn_vb,
             chunks: HashMap::new(),
+            tx,
+            rx,
+            pending: HashSet::new(),
+            view_r: R_CHUNKS,
+            adapt_t: Instant::now(),
+            low_s: 0.0,
+            high_s: 0.0,
             depth_view,
             batch: Vec::with_capacity(MAX_DYN_VERTS),
             part: Vec::with_capacity(8_000),
@@ -447,18 +478,89 @@ impl Renderer {
         self.depth_view = make_depth(&self.device, w, h);
     }
 
-    /// Build missing chunks around the player (a few ms per frame at most) and drop far ones.
-    fn stream_chunks(&mut self, g: &Game) {
+    /// Upload one finished chunk mesh to the GPU.
+    fn add_chunk(&mut self, key: (i32, i32), verts: &[Vertex], first: bool) {
+        if verts.is_empty() {
+            return;
+        }
+        let vb = self.device.create_buffer_init(&BufferInitDescriptor {
+            label: Some("chunk"),
+            contents: bytemuck::cast_slice(verts),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+        let anim = if first {
+            None // initial load appears instantly
+        } else {
+            let ub = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("chunk_ub"),
+                size: std::mem::size_of::<Uniforms>() as u64,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None,
+                layout: &self.bgl,
+                entries: &[wgpu::BindGroupEntry { binding: 0, resource: ub.as_entire_binding() }],
+            });
+            Some((ub, bg))
+        };
+        self.chunks.insert(key, Chunk { vb, count: verts.len() as u32, born: Instant::now(), anim });
+    }
+
+    /// Adaptive draw distance: if the phone cannot hold ~60 fps for a while, shrink the view; if it is
+    /// comfortably fast, grow it back.
+    fn adapt_quality(&mut self, fps: u32) {
+        let dt = self.adapt_t.elapsed().as_secs_f32();
+        self.adapt_t = Instant::now();
+        if dt > 0.5 || fps == 0 {
+            return; // ignore hitches / start-up
+        }
+        if fps < 52 {
+            self.low_s += dt;
+            self.high_s = 0.0;
+        } else if fps > 80 {
+            self.high_s += dt;
+            self.low_s = 0.0;
+        } else {
+            self.low_s = 0.0;
+            self.high_s = 0.0;
+        }
+        if self.low_s > 2.5 && self.view_r > R_MIN {
+            self.view_r -= 1;
+            self.low_s = 0.0;
+        } else if self.high_s > 8.0 && self.view_r < R_CHUNKS {
+            self.view_r += 1;
+            self.high_s = 0.0;
+        }
+    }
+
+    /// Chunk meshes are built on a background thread (never stalls a frame); the main thread only uploads them.
+    fn stream_chunks(&mut self, g: &Game, fps: u32) {
+        self.adapt_quality(fps);
+        let r = self.view_r;
         let pcx = (g.pos.x / CHUNK).floor() as i32;
         let pcz = (g.pos.z / CHUNK).floor() as i32;
-        self.chunks
-            .retain(|k, _| (k.0 - pcx).abs() <= R_CHUNKS + 1 && (k.1 - pcz).abs() <= R_CHUNKS + 1);
+        self.chunks.retain(|k, _| (k.0 - pcx).abs() <= r + 1 && (k.1 - pcz).abs() <= r + 1);
+        self.pending.retain(|k| (k.0 - pcx).abs() <= r + 1 && (k.1 - pcz).abs() <= r + 1);
+
+        // collect finished meshes (at most two uploads per frame)
+        for _ in 0..2 {
+            match self.rx.try_recv() {
+                Ok((key, verts)) => {
+                    self.pending.remove(&key);
+                    if (key.0 - pcx).abs() <= r + 1 && (key.1 - pcz).abs() <= r + 1 && !self.chunks.contains_key(&key) {
+                        self.add_chunk(key, &verts, false);
+                    }
+                }
+                Err(_) => break,
+            }
+        }
 
         let mut missing: Vec<(i32, (i32, i32))> = Vec::new();
-        for dz in -R_CHUNKS..=R_CHUNKS {
-            for dx in -R_CHUNKS..=R_CHUNKS {
+        for dz in -r..=r {
+            for dx in -r..=r {
                 let key = (pcx + dx, pcz + dz);
-                if !self.chunks.contains_key(&key) {
+                if !self.chunks.contains_key(&key) && !self.pending.contains(&key) {
                     missing.push((dx * dx + dz * dz, key));
                 }
             }
@@ -468,47 +570,29 @@ impl Renderer {
         }
         missing.sort_by_key(|m| m.0); // nearest first
 
-        // First frame: build everything at once. Afterwards: a small time budget per frame.
-        let budget = if self.chunks.is_empty() {
-            Duration::from_millis(1500)
-        } else {
-            Duration::from_millis(3)
-        };
-        let first = self.chunks.is_empty();
-        let t0 = Instant::now();
-        let mut built = 0;
+        if self.chunks.is_empty() && self.pending.is_empty() {
+            // first frame: build everything right away so the world is there from the start
+            let t0 = Instant::now();
+            for (_, key) in missing {
+                if t0.elapsed() > Duration::from_millis(1500) {
+                    break;
+                }
+                let mut v = std::mem::take(&mut self.part);
+                v.clear();
+                build_chunk(key.0, key.1, &mut v);
+                self.add_chunk(key, &v, true);
+                self.part = v;
+            }
+            return;
+        }
+        // later: hand the nearest missing chunks to the worker (a few at a time so the closest are always first)
         for (_, key) in missing {
-            if built > 0 && t0.elapsed() > budget {
+            if self.pending.len() >= 4 {
                 break;
             }
-            self.part.clear();
-            build_chunk(key.0, key.1, &mut self.part);
-            built += 1;
-            if self.part.is_empty() {
-                continue;
+            if self.tx.send(key).is_ok() {
+                self.pending.insert(key);
             }
-            let vb = self.device.create_buffer_init(&BufferInitDescriptor {
-                label: Some("chunk"),
-                contents: bytemuck::cast_slice(&self.part),
-                usage: wgpu::BufferUsages::VERTEX,
-            });
-            let anim = if first {
-                None // initial load appears instantly
-            } else {
-                let ub = self.device.create_buffer(&wgpu::BufferDescriptor {
-                    label: Some("chunk_ub"),
-                    size: std::mem::size_of::<Uniforms>() as u64,
-                    usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-                    mapped_at_creation: false,
-                });
-                let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: None,
-                    layout: &self.bgl,
-                    entries: &[wgpu::BindGroupEntry { binding: 0, resource: ub.as_entire_binding() }],
-                });
-                Some((ub, bg))
-            };
-            self.chunks.insert(key, Chunk { vb, count: self.part.len() as u32, born: Instant::now(), anim });
         }
     }
 
@@ -542,7 +626,7 @@ impl Renderer {
         );
 
         // ---- static world: built once per chunk, cached on the GPU ----
-        self.stream_chunks(g);
+        self.stream_chunks(g, fps);
 
         // spawn animation: new chunks rise out of the fog with an ease-out curve
         let world_u = Uniforms {

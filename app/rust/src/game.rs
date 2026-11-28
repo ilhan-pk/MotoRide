@@ -114,6 +114,10 @@ fn road_param(x: f32, z: f32) -> f32 {
 }
 
 pub fn terrain_h(x: f32, z: f32) -> f32 {
+    trail_adjust(x, z, terrain_road(x, z))
+}
+
+fn terrain_road(x: f32, z: f32) -> f32 {
     let nat = natural(x, z);
     // cheap reject for points far from the road
     if (x - road_x(z)).abs() >= 80.0 {
@@ -156,7 +160,7 @@ fn smooth(e0: f32, e1: f32, v: f32) -> f32 {
 /// can never poke through the asphalt / sand (the physics ground stays `terrain_h`).
 fn mesh_h(x: f32, z: f32) -> f32 {
     let d = road_off(x, z);
-    terrain_h(x, z) - 0.45 * (1.0 - smooth(8.0, 17.0, d))
+    terrain_h(x, z) - 0.45 * (1.0 - smooth(8.0, 17.0, d)) - trail_mesh_sink(x, z)
 }
 
 fn grad(x: f32, z: f32) -> (f32, f32) {
@@ -174,6 +178,13 @@ fn road_dist(x: f32, z: f32) -> f32 {
 }
 
 fn rail_exists(side: i32, blk: i32) -> bool {
+    // open the roadside next to a detour's fork so you can turn off the road
+    let zc = blk as f32 * BLOCK + 3.0;
+    if let Some(zn) = zone_at(zc) {
+        if side as f32 == zn.side && (zc < zn.a + 160.0 || zc > zn.b - 160.0) {
+            return false;
+        }
+    }
     hash(blk, side * 7 + 3) % 4 != 0
 }
 
@@ -189,6 +200,9 @@ fn tree_at(ix: i32, iz: i32) -> Option<(f32, f32, f32)> {
     let z = (iz as f32 + 0.1 + 0.8 * jz) * TREE_CELL;
     let dd = road_dist(x, z);
     if dd < RAIL_OFF + 2.5 {
+        return None;
+    }
+    if canyon_tint(x, z) > 0.12 {
         return None;
     }
     if near_building(x, z, 3.0) || near_bull(x, z, 2.5) {
@@ -222,8 +236,10 @@ fn terrain_color(x: f32, z: f32, slope: f32) -> [f32; 3] {
     c = mix(c, [0.56, 0.82, 0.30], fine * 0.25);
     let mud = mud_amount(x, z);
     c = mix(c, [0.45, 0.32, 0.20], mud * 0.92);
+    let ct = canyon_tint(x, z);
+    c = mix(c, [0.80, 0.70, 0.64], ct * 0.92);
     let rock = ((slope - 0.45) / 0.3).clamp(0.0, 1.0);
-    mix(c, [0.50, 0.50, 0.44], rock * 0.55)
+    mix(c, if ct > 0.3 { [0.62, 0.55, 0.52] } else { [0.50, 0.50, 0.44] }, rock * 0.55)
 }
 
 fn sand_w(z: f32, side: i32) -> f32 {
@@ -264,6 +280,343 @@ fn in_chunk(x: f32, z: f32, x0: f32, z0: f32) -> bool {
     x >= x0 && x < x0 + CHUNK && z >= z0 && z < z0 + CHUNK
 }
 
+
+// ------------------------------------------------------------------
+// Canyon detour: a rough dirt trail forks off the main road, winds between giant low-poly rocks, crosses
+// chasms on plank bridges and rejoins the road further on. No traffic here.
+// ------------------------------------------------------------------
+
+const ZONE_CELL: f32 = 1500.0;
+const TRAIL_HALF: f32 = 3.6; // half width of the dirt path
+const TRAIL_OFF: f32 = 66.0; // lateral distance from the main road at the far point of the detour
+const TRAIL_START_OFF: f32 = 10.5; // where the trail forks off the road
+const PIT_DEPTH: f32 = 26.0;
+const ROCK_CELL: f32 = 100.0;
+
+#[derive(Clone, Copy)]
+struct Zone {
+    a: f32,
+    b: f32,
+    side: f32,
+}
+
+fn zone_cell(iz: i32) -> Option<Zone> {
+    if iz == -1 {
+        // the first detour is always near the start so it is easy to find
+        return Some(Zone { a: -1100.0, b: -400.0, side: 1.0 });
+    }
+    let h = hash(iz * 5 + 2, 9001);
+    if h % 100 >= 62 {
+        return None;
+    }
+    let a = iz as f32 * ZONE_CELL + 150.0 + ((h >> 8) % 300) as f32;
+    let len = 640.0 + ((h >> 16) % 5) as f32 * 60.0;
+    let side = if (h >> 20) & 1 == 0 { 1.0 } else { -1.0 };
+    Some(Zone { a, b: a + len, side })
+}
+
+fn zone_at(z: f32) -> Option<Zone> {
+    let zn = zone_cell((z / ZONE_CELL).floor() as i32)?;
+    if z >= zn.a - 2.0 && z <= zn.b + 2.0 {
+        Some(zn)
+    } else {
+        None
+    }
+}
+
+/// 0 at both ends of a detour, 1 in the middle.
+fn zone_gate(z: f32, zn: &Zone, edge: f32) -> f32 {
+    smooth(zn.a, zn.a + edge, z) * (1.0 - smooth(zn.b - edge, zn.b, z))
+}
+
+fn trail_off(z: f32, zn: &Zone) -> f32 {
+    let g = zone_gate(z, zn, 230.0);
+    TRAIL_START_OFF + (TRAIL_OFF - TRAIL_START_OFF) * g + 8.0 * (z / 55.0).sin() * zone_gate(z, zn, 250.0)
+}
+
+fn trail_x(z: f32, zn: &Zone) -> f32 {
+    road_x(z) + zn.side * trail_off(z, zn)
+}
+
+fn trail_dx(z: f32, zn: &Zone) -> f32 {
+    (trail_x(z + 0.5, zn) - trail_x(z - 0.5, zn))
+}
+
+/// Trail surface height: equals the road height at the fork, follows the hills further in.
+fn trail_h(z: f32, zn: &Zone) -> f32 {
+    let r = road_target(z);
+    r + (base_h(trail_x(z, zn), z) - r) * 0.55 * zone_gate(z, zn, 230.0)
+}
+
+/// Chasm amount (0..1) along the trail: plank bridges span these.
+fn pit_amt(z: f32, zn: &Zone) -> f32 {
+    let mut best = 0.0f32;
+    let mut c = zn.a + 300.0;
+    while c < zn.b - 220.0 {
+        best = best.max(1.0 - smooth(11.0, 19.0, (z - c).abs()));
+        c += 280.0;
+    }
+    best
+}
+
+/// Signed lateral distance from the trail centre line (perpendicular approximation).
+fn trail_lat(x: f32, z: f32, zn: &Zone) -> f32 {
+    let tdx = trail_dx(z, zn);
+    (x - trail_x(z, zn)) / (1.0 + tdx * tdx).sqrt()
+}
+
+/// 0..1: how much of a rocky canyon this spot is (no trees / flowers / buildings / bulls in there).
+fn canyon_tint(x: f32, z: f32) -> f32 {
+    let Some(zn) = zone_at(z) else { return 0.0 };
+    let al = (x - trail_x(z, &zn)).abs();
+    if al > 50.0 {
+        return 0.0;
+    }
+    let wg = smooth(zn.a, zn.a + 60.0, z) * (1.0 - smooth(zn.b - 60.0, zn.b, z));
+    (1.0 - smooth(18.0, 46.0, al)) * wg
+}
+
+/// Ground height change caused by the detour (flat trail bed + chasms), applied on top of the road terrain.
+fn trail_adjust(x: f32, z: f32, h: f32) -> f32 {
+    let Some(zn) = zone_at(z) else { return h };
+    let tx = trail_x(z, &zn);
+    if (x - tx).abs() > 60.0 {
+        return h;
+    }
+    let al = trail_lat(x, z, &zn).abs();
+    if al >= 28.0 {
+        return h;
+    }
+    let w = 1.0 - smooth(9.0, 28.0, al);
+    let wg = smooth(zn.a, zn.a + 25.0, z) * (1.0 - smooth(zn.b - 25.0, zn.b, z));
+    let mut r = h + (trail_h(z, &zn) - h) * w * wg;
+    let p = pit_amt(z, &zn);
+    if p > 0.0 {
+        r -= PIT_DEPTH * p * (1.0 - smooth(6.0, 24.0, al)) * smooth(3.8, 6.0, al);
+    }
+    r
+}
+
+/// Extra visual sinking of the coarse terrain mesh under the trail / bridge (physics ground unchanged).
+fn trail_mesh_sink(x: f32, z: f32) -> f32 {
+    let Some(zn) = zone_at(z) else { return 0.0 };
+    if (x - trail_x(z, &zn)).abs() > 40.0 {
+        return 0.0;
+    }
+    let al = trail_lat(x, z, &zn).abs();
+    let wg = smooth(zn.a, zn.a + 25.0, z) * (1.0 - smooth(zn.b - 25.0, zn.b, z));
+    let mut s = 0.45 * (1.0 - smooth(5.0, 12.0, al)) * wg;
+    let p = pit_amt(z, &zn);
+    if p > 0.0 {
+        s += PIT_DEPTH * p * (1.0 - smooth(6.0, 24.0, al)) * (1.0 - smooth(3.8, 6.0, al));
+    }
+    s
+}
+
+#[derive(Clone, Copy)]
+pub struct Rock {
+    pub x: f32,
+    pub z: f32,
+    pub r: f32,
+    pub h: f32,
+    pub seed: u32,
+}
+
+fn rocks_compute(iz: i32) -> Vec<Rock> {
+    let mut v = Vec::new();
+    let z0 = iz as f32 * ROCK_CELL;
+    if zone_cell((z0 / ZONE_CELL).floor() as i32).is_none() {
+        return v;
+    }
+    const N: i32 = 7;
+    for row in 0..2i32 {
+        for j in 0..N {
+            for sgi in 0..2i32 {
+                let sg = if sgi == 0 { -1.0f32 } else { 1.0 };
+                let hs = hash(iz * 97 + j * 13 + row * 5 + sgi * 3, 4711 + row);
+                let u = |k: u32| ((hs >> (k * 5)) & 31) as f32 / 31.0;
+                if u(5) < 0.12 {
+                    continue; // a gap now and then
+                }
+                let z = z0 + (j as f32 + 0.5 + (u(0) - 0.5) * 0.9) * (ROCK_CELL / N as f32);
+                let Some(zn) = zone_at(z) else { continue };
+                if zone_gate(z, &zn, 230.0) < 0.55 || pit_amt(z, &zn) > 0.02 {
+                    continue;
+                }
+                let (r, lat, h) = if row == 0 {
+                    let r = 3.4 + 4.6 * u(1);
+                    (r, TRAIL_HALF + 1.6 + r * 0.85 + 1.5 * u(2), r * (1.5 + 1.8 * u(3)))
+                } else {
+                    let r = 7.0 + 8.0 * u(1);
+                    (r, TRAIL_HALF + 13.0 + r + 8.0 * u(2), r * (2.0 + 2.2 * u(3)))
+                };
+                let tdx = trail_dx(z, &zn);
+                let sd = (1.0 + tdx * tdx).sqrt();
+                let x = trail_x(z, &zn) + sg * lat / sd;
+                let zz = z - sg * lat * tdx / sd;
+                if road_off(x, zz) < 21.0 + r {
+                    continue;
+                }
+                v.push(Rock { x, z: zz, r, h, seed: hs });
+            }
+        }
+    }
+    v
+}
+
+fn rock_cell(iz: i32) -> Vec<Rock> {
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+    thread_local! {
+        static CACHE: RefCell<HashMap<i32, Vec<Rock>>> = RefCell::new(HashMap::new());
+    }
+    CACHE.with(|c| {
+        let mut c = c.borrow_mut();
+        if c.len() > 800 {
+            c.clear();
+        }
+        c.entry(iz).or_insert_with(|| rocks_compute(iz)).clone()
+    })
+}
+
+/// Faceted low-poly boulder / pillar (pale rock, flat shaded like the reference picture).
+fn push_rock(out: &mut Vec<Vertex>, rk: &Rock) {
+    let gy = terrain_h(rk.x, rk.z);
+    let mut s = rk.seed ^ 0x5bd1_e995;
+    let mut rnd = move || {
+        s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        ((s >> 8) & 0xffff) as f32 / 65535.0
+    };
+    const N: usize = 6;
+    let tone = 0.88 + 0.12 * rnd();
+    let warm = rnd();
+    let base = [(0.84 + 0.05 * warm) * tone, (0.77 - 0.02 * warm) * tone, (0.74 - 0.05 * warm) * tone];
+    // rings: (height, radius factor, sideways shift factor)
+    let rings: [(f32, f32, f32); 3] = [(-2.5, 1.05, 0.0), (0.34 * rk.h, 0.95 + 0.25 * rnd(), 0.08), (0.70 * rk.h, 0.58 + 0.12 * rnd(), 0.20)];
+    let lean = (rnd() * 6.283, rnd());
+    let mut pts: Vec<[Vec3; N]> = Vec::new();
+    for (k, &(yy, rf, sh)) in rings.iter().enumerate() {
+        let mut ring = [Vec3::ZERO; N];
+        let ox = lean.0.cos() * sh * rk.r * lean.1;
+        let oz = lean.0.sin() * sh * rk.r * lean.1;
+        for i in 0..N {
+            let a = (i as f32 + 0.35 * (rnd() - 0.5)) * 6.283 / N as f32;
+            let rr = rk.r * rf * (0.82 + 0.36 * rnd());
+            let y = if k == 0 { gy + yy } else { gy + yy + 0.8 * (rnd() - 0.5) };
+            ring[i] = Vec3::new(rk.x + ox + a.cos() * rr, y, rk.z + oz + a.sin() * rr);
+        }
+        pts.push(ring);
+    }
+    let apex = Vec3::new(rk.x + lean.0.cos() * 0.3 * rk.r * lean.1 + (rnd() - 0.5) * 0.3 * rk.r, gy + rk.h, rk.z + lean.0.sin() * 0.3 * rk.r * lean.1 + (rnd() - 0.5) * 0.3 * rk.r);
+    let centre = Vec3::new(rk.x, gy + rk.h * 0.4, rk.z);
+    let sun = Vec3::new(0.45, 0.80, 0.40).normalize();
+    let mut tri = |a: Vec3, b: Vec3, c: Vec3| {
+        let mut n = (b - a).cross(c - a);
+        if n.length() < 1e-6 {
+            return;
+        }
+        n = n.normalize();
+        if n.dot((a + b + c) / 3.0 - centre) < 0.0 {
+            n = Vec3::new(-n.x, -n.y, -n.z);
+        }
+        let shade = (0.46 + 0.62 * n.dot(sun).max(0.0) + 0.14 * n.y).clamp(0.40, 1.10);
+        let var = 0.94 + 0.10 * ((a.x * 7.3 + a.z * 3.1).sin() * 0.5 + 0.5);
+        let col = [(base[0] * shade * var).min(1.0), (base[1] * shade * var).min(1.0), (base[2] * shade * var).min(1.0)];
+        for p in [a, b, c] {
+            out.push(Vertex { pos: p.to_array(), color: col, kind: 1.0 });
+        }
+    };
+    for k in 0..2 {
+        for i in 0..N {
+            let j = (i + 1) % N;
+            let (a, b, c, d) = (pts[k][i], pts[k][j], pts[k + 1][j], pts[k + 1][i]);
+            tri(a, b, c);
+            tri(a, c, d);
+        }
+    }
+    for i in 0..N {
+        let j = (i + 1) % N;
+        tri(pts[2][i], pts[2][j], apex);
+    }
+}
+
+fn build_rocks(x0: f32, z0: f32, out: &mut Vec<Vertex>) {
+    let i0 = (z0 / ROCK_CELL).floor() as i32;
+    let i1 = ((z0 + CHUNK) / ROCK_CELL).floor() as i32;
+    for iz in i0..=i1 {
+        for rk in rock_cell(iz) {
+            if in_chunk(rk.x, rk.z, x0, z0) {
+                push_rock(out, &rk);
+            }
+        }
+    }
+}
+
+/// Dirt trail ribbon and plank bridges.
+fn build_trail(x0: f32, z0: f32, out: &mut Vec<Vertex>) {
+    const STEP: f32 = 3.0;
+    let c0 = ((z0 - 10.0) / ZONE_CELL).floor() as i32;
+    let c1 = ((z0 + CHUNK + 10.0) / ZONE_CELL).floor() as i32;
+    for ci in c0..=c1 {
+        let Some(zn) = zone_cell(ci) else { continue };
+        if zn.b < z0 - 10.0 || zn.a > z0 + CHUNK + 10.0 {
+            continue;
+        }
+        let tp = |z: f32, off: f32, lift: f32| -> [f32; 3] {
+            let tx = trail_x(z, &zn);
+            let tdx = trail_dx(z, &zn);
+            let sd = (1.0 + tdx * tdx).sqrt();
+            [tx + off / sd, trail_h(z, &zn) + lift, z - off * tdx / sd]
+        };
+        let half = |z: f32| TRAIL_HALF * smooth(zn.a, zn.a + 30.0, z) * (1.0 - smooth(zn.b - 30.0, zn.b, z));
+        let k0 = ((z0.max(zn.a) - STEP) / STEP).floor() as i32;
+        let k1 = ((((z0 + CHUNK).min(zn.b)) + STEP) / STEP).ceil() as i32;
+        for k in k0..k1 {
+            let (za, zb) = (k as f32 * STEP, (k + 1) as f32 * STEP);
+            let zm = 0.5 * (za + zb);
+            if zm < zn.a || zm > zn.b {
+                continue;
+            }
+            let (wa, wb) = (half(za), half(zb));
+            if wa < 0.15 && wb < 0.15 {
+                continue;
+            }
+            let mx = trail_x(zm, &zn);
+            if !in_chunk(mx, zm, x0, z0) {
+                continue;
+            }
+            let idx = k;
+            let tint = 0.93 + 0.12 * h01(idx, 313);
+            let pit = pit_amt(zm, &zn);
+            if pit < 0.06 {
+                // packed dirt with two darker wheel ruts
+                quad(out, [tp(za, -wa, 0.21), tp(za, wa, 0.21), tp(zb, wb, 0.21), tp(zb, -wb, 0.21)], scale([0.66, 0.50, 0.36], tint));
+                for &sd in &[-1.0f32, 1.0] {
+                    let (o0, o1) = (sd * 0.7, sd * 1.5);
+                    quad(out, [tp(za, o0 * wa / TRAIL_HALF, 0.23), tp(za, o1 * wa / TRAIL_HALF, 0.23), tp(zb, o1 * wb / TRAIL_HALF, 0.23), tp(zb, o0 * wb / TRAIL_HALF, 0.23)], scale([0.52, 0.38, 0.27], tint));
+                }
+            } else {
+                // wooden plank bridge: planks, stringers, posts and rope rails
+                for q in 0..3 {
+                    let pz = za + q as f32;
+                    let c = if (idx * 3 + q) & 1 == 0 { [0.80, 0.47, 0.20] } else { [0.66, 0.38, 0.17] };
+                    quad(out, [tp(pz, -2.55, 0.27), tp(pz, 2.55, 0.27), tp(pz + 0.84, 2.55, 0.27), tp(pz + 0.84, -2.55, 0.27)], scale(c, tint));
+                }
+                for &sd in &[-2.2f32, 2.2] {
+                    quad(out, [tp(za, sd - 0.14, 0.20), tp(za, sd + 0.14, 0.20), tp(zb, sd + 0.14, 0.20), tp(zb, sd - 0.14, 0.20)], [0.30, 0.20, 0.12]);
+                }
+                for &sd in &[-2.8f32, 2.8] {
+                    let p = tp(za, sd, 0.0);
+                    push_box(out, Mat4::IDENTITY, Vec3::new(p[0], p[1] + 0.68, p[2]), Vec3::new(0.09, 0.68, 0.09), [0.36, 0.24, 0.14]);
+                    for &hgt in &[0.60f32, 1.15] {
+                        quad(out, [tp(za, sd, hgt), tp(zb, sd, hgt), tp(zb, sd, hgt + 0.07), tp(za, sd, hgt + 0.07)], [0.86, 0.76, 0.54]);
+                    }
+                }
+            }
+        }
+    }
+}
+
 // ------------------------------------------------------------------
 // Chunk mesh building (pure function of the world; cached by the renderer)
 // ------------------------------------------------------------------
@@ -274,6 +627,8 @@ pub fn build_chunk(cx: i32, cz: i32, out: &mut Vec<Vertex>) {
     build_terrain(x0, z0, out);
     build_ribbon(x0, z0, out);
     build_props(x0, z0, out);
+    build_trail(x0, z0, out);
+    build_rocks(x0, z0, out);
     build_flowers(cx, cz, out);
     if TREES {
         build_trees(cx, cz, out);
@@ -625,7 +980,7 @@ fn bull_compute(iz: i32) -> Vec<Bull> {
         let cx = road_x(zr) + side * off / s;
         let cz = zr - side * off * rp / s;
         let (gx, gz) = grad(cx, cz);
-        if (gx * gx + gz * gz).sqrt() < 0.30 && !near_building(cx, cz, 7.0) && mud_amount(cx, cz) < 0.5 {
+        if (gx * gx + gz * gz).sqrt() < 0.30 && canyon_tint(cx, cz) < 0.1 && !near_building(cx, cz, 7.0) && mud_amount(cx, cz) < 0.5 {
             centre = Some((cx, cz));
             break;
         }
@@ -890,7 +1245,7 @@ fn bld_compute(iz: i32) -> Vec<Bld> {
                 lo = lo.min(t);
                 hi = hi.max(t);
             }
-            if hi - lo < 3.2 {
+            if hi - lo < 3.2 && canyon_tint(bx, bz) < 0.1 {
                 best = Some((bx, bz, lo, rp));
                 break;
             }
@@ -979,7 +1334,7 @@ fn build_flowers(cx: i32, cz: i32, out: &mut Vec<Vertex>) {
             if ((h & 0xff) as f32 / 255.0) > p {
                 continue;
             }
-            if near_building(px, pz, 3.5) || near_bull(px, pz, 2.5) || mud_amount(px, pz) > 0.25 {
+            if canyon_tint(px, pz) > 0.1 || near_building(px, pz, 3.5) || near_bull(px, pz, 2.5) || mud_amount(px, pz) > 0.25 {
                 continue;
             }
             let col = FLOWER_COLORS[((h >> 24) % 7) as usize];
@@ -1296,6 +1651,7 @@ pub enum Surf {
     Grass,
     Mud,
     Rock,
+    Dirt,
 }
 
 struct SurfP {
@@ -1314,6 +1670,7 @@ fn surf_params(s: Surf) -> SurfP {
         Surf::Grass => SurfP { mu: 0.80, drag: 0.09, rough: 0.035 },
         Surf::Mud => SurfP { mu: 0.50, drag: 0.26, rough: 0.055 },
         Surf::Rock => SurfP { mu: 0.85, drag: 0.07, rough: 0.100 },
+        Surf::Dirt => SurfP { mu: 0.92, drag: 0.05, rough: 0.060 },
     }
 }
 
@@ -1324,6 +1681,11 @@ fn surface_at(x: f32, z: f32, slope: f32) -> Surf {
     let off = (dxr * dxr + dzr * dzr).sqrt();
     if off < ROAD_HALF + 0.7 {
         return Surf::Asphalt;
+    }
+    if let Some(zn) = zone_at(z) {
+        if (x - trail_x(z, &zn)).abs() < TRAIL_HALF + 1.0 && trail_lat(x, z, &zn).abs() < TRAIL_HALF + 0.3 && zone_gate(z, &zn, 40.0) > 0.05 {
+            return if pit_amt(z, &zn) > 0.05 { Surf::Rock } else { Surf::Dirt };
+        }
     }
     let side = if dxr >= 0.0 { 1 } else { -1 };
     if off < ROAD_HALF + 0.7 + sand_w(zr, side) {
@@ -1511,6 +1873,8 @@ impl Game {
         self.rail_collision();
         self.tree_collision();
         self.building_collision();
+        self.rock_collision();
+        self.bridge_collision();
         self.bull_collision();
         self.car_collision();
 
@@ -1842,6 +2206,56 @@ impl Game {
                         self.vel = self.vel * 0.6;
                     }
                 }
+            }
+        }
+    }
+
+    /// Giant canyon rocks are solid.
+    fn rock_collision(&mut self) {
+        if zone_cell((self.pos.z / ZONE_CELL).floor() as i32).is_none() {
+            return;
+        }
+        let iz0 = (self.pos.z / ROCK_CELL).floor() as i32;
+        for iz in iz0 - 1..=iz0 + 1 {
+            for rk in rock_cell(iz) {
+                let (dx, dz) = (self.pos.x - rk.x, self.pos.z - rk.z);
+                let rr = rk.r * 0.88 + 0.5;
+                let d2 = dx * dx + dz * dz;
+                if d2 < rr * rr {
+                    let d = d2.sqrt().max(0.01);
+                    let (nx, nz) = (dx / d, dz / d);
+                    self.pos.x = rk.x + nx * rr;
+                    self.pos.z = rk.z + nz * rr;
+                    let vn = self.vel.x * nx + self.vel.z * nz;
+                    if vn < 0.0 {
+                        self.vel.x -= vn * nx * 1.2;
+                        self.vel.z -= vn * nz * 1.2;
+                        self.vel = self.vel * 0.55;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Rope rails of the plank bridges keep the bike on the deck.
+    fn bridge_collision(&mut self) {
+        let z = self.pos.z;
+        let Some(zn) = zone_at(z) else { return };
+        if pit_amt(z, &zn) < 0.005 {
+            return;
+        }
+        let tdx = trail_dx(z, &zn);
+        let sd = (1.0 + tdx * tdx).sqrt();
+        let lat = (self.pos.x - trail_x(z, &zn)) / sd;
+        const LIM: f32 = 2.85;
+        if lat.abs() > LIM {
+            let sgn = lat.signum();
+            self.pos.x = trail_x(z, &zn) + sgn * LIM * sd;
+            let n = Vec3::new(1.0, 0.0, -tdx) / sd * sgn;
+            let vn = self.vel.dot(n);
+            if vn > 0.0 {
+                self.vel -= n * (vn * 1.15);
+                self.vel = self.vel * 0.985;
             }
         }
     }

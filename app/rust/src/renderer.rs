@@ -10,9 +10,9 @@ use winit::window::Window;
 use crate::game::{build_chunk, bull_model, bulls_around, buildings_around, car_models, fox_model, models, Game, Vertex, BULL_ANIM_FPS, CHUNK, FOX_SCALE};
 use crate::hud;
 
-const MAX_BALLOON_VERTS: usize = 3_000;
+const MAX_BALLOON_VERTS: usize = 6_000;
 const MAX_COCKPIT_VERTS: usize = 9000;
-const MAX_HUD_VERTS: usize = 600;
+const MAX_HUD_VERTS: usize = 1_000;
 const MAX_DYN_VERTS: usize = MAX_BALLOON_VERTS + MAX_COCKPIT_VERTS + MAX_HUD_VERTS;
 /// Chunks kept around the player (each side). 4 -> 9 x 9 chunks = 720 m square.
 const R_CHUNKS: i32 = 4;
@@ -78,7 +78,7 @@ pub struct Renderer {
     batch: Vec<Vertex>,
     part: Vec<Vertex>,
     hud_cache: Vec<Vertex>,
-    hud_key: (u32, u32),
+    hud_key: (u32, u32, bool),
     bgl: wgpu::BindGroupLayout,
     /// Shared building models (vertex buffer, vertex count) and per-instance uniform pool.
     bmodels: Vec<(wgpu::Buffer, u32)>,
@@ -454,7 +454,7 @@ impl Renderer {
             batch: Vec::with_capacity(MAX_DYN_VERTS),
             part: Vec::with_capacity(8_000),
             hud_cache: Vec::new(),
-            hud_key: (u32::MAX, 0),
+            hud_key: (u32::MAX, 0, false),
             bgl,
             bmodels,
             bpool: Vec::new(),
@@ -656,6 +656,7 @@ impl Renderer {
 
         self.part.clear();
         g.build_balloons(&mut self.part);
+        g.build_ai(&mut self.part);
         self.part.truncate(MAX_BALLOON_VERTS - MAX_BALLOON_VERTS % 3);
         let n_balloon = self.part.len() as u32;
         self.batch.extend_from_slice(&self.part);
@@ -668,11 +669,13 @@ impl Renderer {
 
         // The FPS text only changes a couple of times per second: rebuild it only then.
         let aspect_key = (aspect * 1000.0) as u32;
-        if self.hud_key != (fps, aspect_key) {
+        let ai_on = g.ai.is_some();
+        if self.hud_key != (fps, aspect_key, ai_on) {
             self.hud_cache.clear();
             hud::build_fps(&mut self.hud_cache, fps, aspect);
+            hud::build_ai_button(&mut self.hud_cache, aspect, ai_on);
             self.hud_cache.truncate(MAX_HUD_VERTS);
-            self.hud_key = (fps, aspect_key);
+            self.hud_key = (fps, aspect_key, ai_on);
         }
         let n_hud = self.hud_cache.len() as u32;
         self.batch.extend_from_slice(&self.hud_cache);

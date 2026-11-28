@@ -57,6 +57,17 @@ impl App {
         let Some(win) = &self.window else { return };
         let size = win.inner_size();
         let (w, h) = (size.width as f64, size.height as f64);
+        if phase == TouchPhase::Started {
+            // small "AI" button under the FPS bar toggles the AI rider
+            let aspect = (w / h) as f32;
+            let (bx0, by0, bx1, by1) = hud::ai_button_rect(aspect);
+            let cx = (x / w * 2.0 - 1.0) as f32;
+            let cy = (1.0 - y / h * 2.0) as f32;
+            if cx > bx0 - 0.03 && cx < bx1 + 0.03 / aspect.max(1.0) * 2.0 && cy > by0 - 0.05 && cy < by1 + 0.03 {
+                self.game.toggle_ai();
+                return;
+            }
+        }
         let t = &mut self.touches;
         match phase {
             TouchPhase::Started => {

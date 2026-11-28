@@ -617,6 +617,371 @@ fn build_trail(x0: f32, z0: f32, out: &mut Vec<Vertex>) {
     }
 }
 
+
+// ------------------------------------------------------------------
+// AI rider: a second bike (blue) that rides the main road like a pro: smooth lane changes, threads
+// between cars, leans into corners. Purely kinematic (cheap), toggled by the HUD "AI" button.
+// ------------------------------------------------------------------
+
+const AI_LATS: [f32; 7] = [-4.3, -2.9, -1.45, 0.0, 1.45, 2.9, 4.3];
+const AI_VMAX: f32 = 40.0; // m/s (~144 km/h)
+const AI_HORIZON: f32 = 85.0;
+
+#[derive(Clone, Copy)]
+pub struct AiBike {
+    pub zr: f32,
+    pub lat: f32,
+    pub latv: f32,
+    pub tgt: f32,
+    pub v: f32,
+    pub x: f32,
+    pub y: f32,
+    pub z: f32,
+    pub yaw: f32,
+    pub lean: f32,
+    pub pitch: f32,
+    pub wheel: f32,
+}
+
+impl AiBike {
+    fn place(&mut self) {
+        let rp = road_dx(self.zr);
+        let s = (1.0 + rp * rp).sqrt();
+        self.x = road_x(self.zr) + self.lat / s;
+        self.z = self.zr - self.lat * rp / s;
+        self.y = road_target(self.zr) + 0.20;
+        self.yaw = rp.atan() - self.latv.atan2(self.v.max(5.0));
+    }
+}
+
+/// yaw change per metre travelled towards -z (signed)
+fn road_curv(zr: f32) -> f32 {
+    (road_dx(zr - 7.0).atan() - road_dx(zr + 7.0).atan()) / 14.0
+}
+
+impl Game {
+    pub fn toggle_ai(&mut self) {
+        if self.ai.is_some() {
+            self.ai = None;
+        } else {
+            self.spawn_ai(55.0);
+        }
+    }
+
+    fn spawn_ai(&mut self, ahead: f32) {
+        let mut zr = self.pos.z - ahead;
+        for _ in 0..8 {
+            if self.cars.iter().all(|c| (c.zr - zr).abs() > 30.0 || c.lane.abs() < 0.0) {
+                break;
+            }
+            zr -= 25.0;
+        }
+        let mut b = AiBike { zr, lat: 0.0, latv: 0.0, tgt: 0.0, v: self.speed.max(14.0), x: 0.0, y: 0.0, z: 0.0, yaw: 0.0, lean: 0.0, pitch: 0.0, wheel: 0.0 };
+        b.place();
+        self.ai = Some(b);
+    }
+
+    fn update_ai(&mut self, dt: f32) {
+        let Some(mut b) = self.ai else { return };
+        let bz = self.pos.z;
+        // obstacles: (road z, lateral, speed, half width, half length)
+        let mut obs = [(0.0f32, 0.0f32, 0.0f32, 0.0f32, 0.0f32); N_CARS + 2];
+        let mut n = 0;
+        for c in self.cars.iter().take(N_CARS) {
+            obs[n] = (c.zr, c.lane, c.v, c.hw, c.hl);
+            n += 1;
+        }
+        {
+            let rp = road_dx(bz);
+            let s = (1.0 + rp * rp).sqrt();
+            let pl = (self.pos.x - road_x(bz)) / s;
+            if pl.abs() < 8.0 {
+                obs[n] = (bz, pl, self.speed.max(0.0), 0.45, 1.0);
+                n += 1;
+            }
+        }
+        let obs = &obs[..n];
+        let ge = |o: &(f32, f32, f32, f32, f32)| b.zr - o.0 - o.4 - 1.1; // bumper-to-bumper gap, < 0 when alongside
+
+        // ---- lane choice: free lane / gap between two cars, smooth and with hysteresis ----
+        let mut best = (1e9f32, b.tgt);
+        for &c in AI_LATS.iter() {
+            let mut cost = (c - b.lat).abs() * 0.35 + c.abs() * 0.10;
+            if (c - b.tgt).abs() < 0.1 {
+                cost -= 0.8;
+            }
+            let (lo, hi) = (b.lat.min(c), b.lat.max(c));
+            for o in obs {
+                let g = ge(o);
+                let alongside_to = -(2.0 * o.4 + 2.3);
+                if g < alongside_to || g > AI_HORIZON {
+                    continue;
+                }
+                let clear = (c - o.1).abs() - (o.3 + 0.62 + 0.30);
+                if clear < 0.0 {
+                    cost += 6.0 + 120.0 / (g.max(0.0) + 6.0);
+                }
+                let blocks_now = (b.lat - o.1).abs() < o.3 + 0.9;
+                if !blocks_now && g < 22.0 && o.1 + o.3 + 0.9 > lo && o.1 - o.3 - 0.9 < hi {
+                    cost += 25.0;
+                }
+            }
+            if cost < best.0 {
+                best = (cost, c);
+            }
+        }
+        b.tgt = best.1;
+
+        // ---- speed: corner limit, keep behind whatever blocks the current line ----
+        let k = road_curv(b.zr).abs();
+        let mut vt = AI_VMAX.min((6.5 / k.max(1e-4)).sqrt());
+        let lat_pred = b.lat + b.latv * 0.5;
+        for o in obs {
+            let g = ge(o);
+            if g < -(2.0 * o.4 + 2.3) || g > 70.0 {
+                continue;
+            }
+            let w = o.3 + 0.62 + 0.15;
+            if (b.lat - o.1).abs() < w || (lat_pred - o.1).abs() < w {
+                vt = vt.min(o.2 + (g - 7.0).max(0.0) * 0.5);
+            }
+        }
+        let d = b.zr - bz; // + behind the player
+        if d < -130.0 {
+            vt = vt.min(self.speed * 0.85 + 3.0); // let the player catch up
+        }
+        let dv = (vt - b.v).clamp(-9.0 * dt, 6.0 * dt);
+        b.v = (b.v + dv).max(0.0);
+
+        // ---- lateral motion: smooth ----
+        let want = ((b.tgt - b.lat) * 1.5).clamp(-3.2, 3.2);
+        let latv_old = b.latv;
+        b.latv += (want - b.latv) * (dt * 4.0).min(1.0);
+        b.lat = (b.lat + b.latv * dt).clamp(-4.6, 4.6);
+        let latacc = (b.latv - latv_old) / dt.max(1e-3);
+
+        // ---- advance along the road ----
+        let rp = road_dx(b.zr);
+        let sh = (1.0 + rp * rp).sqrt();
+        let rd = (road_target(b.zr + 1.5) - road_target(b.zr - 1.5)) / 3.0;
+        let s3 = (1.0 + rp * rp + rd * rd).sqrt();
+        b.zr -= b.v * dt / s3;
+        b.place();
+        let climb = -rd / sh;
+        b.pitch += (climb.atan() - b.pitch) * (dt * 5.0).min(1.0);
+        let lean_t = ((latacc.clamp(-6.0, 6.0) - b.v * b.v * road_curv(b.zr)) / 9.81).atan().clamp(-0.75, 0.75);
+        b.lean += (lean_t - b.lean) * (dt * 6.0).min(1.0);
+        b.wheel += b.v / 0.32 * dt;
+        if b.wheel > 6283.0 {
+            b.wheel -= 6283.0;
+        }
+
+        // too far behind (the player is faster): come back in front
+        let d = b.zr - bz;
+        if d > 450.0 {
+            let v = b.v;
+            self.spawn_ai(140.0);
+            if let Some(nb) = &mut self.ai {
+                nb.v = v;
+            }
+            return;
+        }
+        self.ai = Some(b);
+    }
+
+    /// The AI bike is solid for the player.
+    fn ai_collision(&mut self) {
+        let Some(b) = self.ai else { return };
+        let (dx, dz) = (self.pos.x - b.x, self.pos.z - b.z);
+        let rr = 0.95;
+        let d2 = dx * dx + dz * dz;
+        if d2 < rr * rr && (self.pos.y - b.y).abs() < 1.6 {
+            let d = d2.sqrt().max(0.01);
+            let (nx, nz) = (dx / d, dz / d);
+            self.pos.x = b.x + nx * rr;
+            self.pos.z = b.z + nz * rr;
+            let bv = Vec3::new(-b.yaw.sin() * b.v, 0.0, -b.yaw.cos() * b.v);
+            let rel = self.vel - bv;
+            let vn = rel.x * nx + rel.z * nz;
+            if vn < 0.0 {
+                self.vel.x -= nx * vn * 1.2;
+                self.vel.z -= nz * vn * 1.2;
+                self.vel = self.vel * 0.9;
+            }
+        }
+    }
+
+    /// World-space mesh of the AI bike + rider (about 1300 vertices, rebuilt every frame).
+    pub fn build_ai(&self, out: &mut Vec<Vertex>) {
+        let Some(b) = &self.ai else { return };
+        let (dx, dz) = (b.x - self.pos.x, b.z - self.pos.z);
+        if dx * dx + dz * dz > 260.0 * 260.0 {
+            return;
+        }
+        let (s, c) = b.yaw.sin_cos();
+        let (sr, cr) = b.lean.sin_cos();
+        let (sp, cp) = b.pitch.sin_cos();
+        let xf = BikeXf { x: b.x, y: b.y, z: b.z, s, c, sr, cr, sp, cp };
+        push_ai_bike(out, &xf, b.wheel);
+    }
+}
+
+struct BikeXf {
+    x: f32,
+    y: f32,
+    z: f32,
+    s: f32,
+    c: f32,
+    sr: f32,
+    cr: f32,
+    sp: f32,
+    cp: f32,
+}
+
+impl BikeXf {
+    /// local (x right, y up, z backwards) -> world
+    fn p(&self, l: [f32; 3]) -> [f32; 3] {
+        let (x1, y1) = (l[0] * self.cr + l[1] * self.sr, -l[0] * self.sr + l[1] * self.cr);
+        let (y2, z2) = (y1 * self.cp - l[2] * self.sp, l[2] * self.cp + y1 * self.sp);
+        [self.x + x1 * self.c + z2 * self.s, self.y + y2, self.z - x1 * self.s + z2 * self.c]
+    }
+}
+
+fn ai_tri(out: &mut Vec<Vertex>, a: [f32; 3], b: [f32; 3], c: [f32; 3], centre: [f32; 3], col: [f32; 3]) {
+    let (u, v) = ([b[0] - a[0], b[1] - a[1], b[2] - a[2]], [c[0] - a[0], c[1] - a[1], c[2] - a[2]]);
+    let mut n = [u[1] * v[2] - u[2] * v[1], u[2] * v[0] - u[0] * v[2], u[0] * v[1] - u[1] * v[0]];
+    let l = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
+    if l < 1e-7 {
+        return;
+    }
+    n = [n[0] / l, n[1] / l, n[2] / l];
+    let m = [(a[0] + b[0] + c[0]) / 3.0 - centre[0], (a[1] + b[1] + c[1]) / 3.0 - centre[1], (a[2] + b[2] + c[2]) / 3.0 - centre[2]];
+    if n[0] * m[0] + n[1] * m[1] + n[2] * m[2] < 0.0 {
+        n = [-n[0], -n[1], -n[2]];
+    }
+    // sun from (-0.35, 0.8, 0.5)
+    let d = (-0.35 * n[0] + 0.8 * n[1] + 0.5 * n[2]) / 1.0;
+    let sh = (0.50 + 0.55 * d.max(0.0) + 0.10 * n[1]).clamp(0.45, 1.12);
+    let col = [(col[0] * sh).min(1.0), (col[1] * sh).min(1.0), (col[2] * sh).min(1.0)];
+    for p in [a, b, c] {
+        out.push(Vertex { pos: p, color: col, kind: 1.0 });
+    }
+}
+
+fn ai_box(out: &mut Vec<Vertex>, xf: &BikeXf, c: [f32; 3], h: [f32; 3], col: [f32; 3]) {
+    let mut p = [[0.0f32; 3]; 8];
+    for i in 0..8 {
+        let sx = if i & 1 == 0 { -1.0 } else { 1.0 };
+        let sy = if i & 2 == 0 { -1.0 } else { 1.0 };
+        let sz = if i & 4 == 0 { -1.0 } else { 1.0 };
+        p[i] = xf.p([c[0] + sx * h[0], c[1] + sy * h[1], c[2] + sz * h[2]]);
+    }
+    let ce = xf.p(c);
+    const F: [[usize; 4]; 6] = [[0, 1, 3, 2], [4, 5, 7, 6], [0, 1, 5, 4], [2, 3, 7, 6], [0, 2, 6, 4], [1, 3, 7, 5]];
+    for f in F.iter() {
+        ai_tri(out, p[f[0]], p[f[1]], p[f[2]], ce, col);
+        ai_tri(out, p[f[0]], p[f[2]], p[f[3]], ce, col);
+    }
+}
+
+/// Rectangular tube between two local points; `tw` is the half width (sideways), `th` the half depth.
+fn ai_bar(out: &mut Vec<Vertex>, xf: &BikeXf, a: [f32; 3], b: [f32; 3], tw: f32, th: f32, col: [f32; 3]) {
+    let d = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+    let dl = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+    if dl < 1e-5 {
+        return;
+    }
+    let d = [d[0] / dl, d[1] / dl, d[2] / dl];
+    let side = if d[0].abs() > 0.9 { [0.0, 1.0, 0.0] } else { [1.0, 0.0, 0.0] };
+    let cross = |p: [f32; 3], q: [f32; 3]| [p[1] * q[2] - p[2] * q[1], p[2] * q[0] - p[0] * q[2], p[0] * q[1] - p[1] * q[0]];
+    let norm = |v: [f32; 3]| {
+        let l = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt().max(1e-6);
+        [v[0] / l, v[1] / l, v[2] / l]
+    };
+    let u = norm(cross(d, side));
+    let w = norm(cross(u, d));
+    let mut p = [[0.0f32; 3]; 8];
+    for i in 0..8 {
+        let e = if i & 4 == 0 { a } else { b };
+        let sw = if i & 1 == 0 { -tw } else { tw };
+        let su = if i & 2 == 0 { -th } else { th };
+        p[i] = xf.p([e[0] + w[0] * sw + u[0] * su, e[1] + w[1] * sw + u[1] * su, e[2] + w[2] * sw + u[2] * su]);
+    }
+    let ce = xf.p([(a[0] + b[0]) * 0.5, (a[1] + b[1]) * 0.5, (a[2] + b[2]) * 0.5]);
+    const F: [[usize; 4]; 6] = [[0, 1, 3, 2], [4, 5, 7, 6], [0, 1, 5, 4], [2, 3, 7, 6], [0, 2, 6, 4], [1, 3, 7, 5]];
+    for f in F.iter() {
+        ai_tri(out, p[f[0]], p[f[1]], p[f[2]], ce, col);
+        ai_tri(out, p[f[0]], p[f[2]], p[f[3]], ce, col);
+    }
+}
+
+fn ai_wheel(out: &mut Vec<Vertex>, xf: &BikeXf, cz: f32, r: f32, hw: f32, rot: f32) {
+    const N: usize = 10;
+    let cy = r;
+    let hub = xf.p([0.0, cy, cz]);
+    let mut ring = [[[0.0f32; 3]; N]; 2];
+    for i in 0..N {
+        let a = rot + i as f32 * std::f32::consts::TAU / N as f32;
+        let (sa, ca) = a.sin_cos();
+        ring[0][i] = xf.p([-hw, cy + r * ca, cz + r * sa]);
+        ring[1][i] = xf.p([hw, cy + r * ca, cz + r * sa]);
+    }
+    let tyre = [0.05, 0.05, 0.055];
+    for i in 0..N {
+        let j = (i + 1) % N;
+        ai_tri(out, ring[0][i], ring[1][i], ring[1][j], hub, tyre);
+        ai_tri(out, ring[0][i], ring[1][j], ring[0][j], hub, tyre);
+        // rim / spokes on both sides (alternating shade shows the spin)
+        let rim = if i % 2 == 0 { [0.80, 0.82, 0.86] } else { [0.20, 0.21, 0.24] };
+        for sd in 0..2 {
+            let hx = if sd == 0 { -hw } else { hw };
+            let hp = xf.p([hx, cy, cz]);
+            ai_tri(out, hp, ring[sd][i], ring[sd][j], hub, rim);
+        }
+    }
+}
+
+fn push_ai_bike(out: &mut Vec<Vertex>, xf: &BikeXf, wheel: f32) {
+    let body = [0.06, 0.34, 0.95];
+    let white = [0.94, 0.94, 0.97];
+    let black = [0.07, 0.07, 0.08];
+    let metal = [0.28, 0.28, 0.31];
+    let chrome = [0.80, 0.82, 0.86];
+    let suit = [0.92, 0.92, 0.95];
+    let helmet = [0.98, 0.78, 0.08];
+
+    ai_wheel(out, xf, 0.68, 0.32, 0.07, wheel);
+    ai_wheel(out, xf, -0.68, 0.31, 0.055, wheel * 1.03);
+    for s in [-1.0f32, 1.0] {
+        ai_bar(out, xf, [s * 0.10, 0.34, 0.66], [s * 0.10, 0.45, 0.15], 0.02, 0.03, black); // swing arm
+        ai_bar(out, xf, [s * 0.10, 0.31, -0.66], [s * 0.09, 0.95, -0.45], 0.02, 0.02, chrome); // fork
+    }
+    ai_bar(out, xf, [-0.36, 1.02, -0.42], [0.36, 1.02, -0.42], 0.02, 0.02, black); // bars
+    ai_bar(out, xf, [0.0, 0.45, 0.25], [0.0, 0.75, -0.35], 0.05, 0.06, black); // frame
+    ai_box(out, xf, [0.0, 0.42, 0.02], [0.13, 0.17, 0.24], metal); // engine
+    ai_box(out, xf, [0.0, 0.85, -0.22], [0.17, 0.12, 0.30], body); // tank
+    ai_box(out, xf, [0.0, 0.975, -0.20], [0.045, 0.02, 0.26], white); // tank stripe
+    ai_box(out, xf, [0.0, 0.80, 0.36], [0.13, 0.05, 0.34], black); // seat
+    ai_box(out, xf, [0.0, 0.78, 0.90], [0.10, 0.03, 0.20], body); // tail
+    ai_box(out, xf, [0.0, 0.76, 1.11], [0.05, 0.03, 0.02], [1.0, 0.1, 0.1]); // tail lamp
+    ai_box(out, xf, [0.0, 1.0, -0.62], [0.09, 0.09, 0.05], [1.0, 0.95, 0.7]); // head lamp
+    ai_box(out, xf, [0.0, 0.68, -0.70], [0.06, 0.015, 0.16], body); // front fender
+    ai_bar(out, xf, [0.19, 0.30, 0.20], [0.21, 0.42, 1.05], 0.045, 0.045, chrome); // exhaust
+    ai_bar(out, xf, [0.21, 0.40, 0.70], [0.23, 0.42, 1.12], 0.06, 0.06, chrome); // silencer
+
+    // rider, crouched like a racer
+    ai_bar(out, xf, [0.0, 0.90, 0.38], [0.0, 1.38, -0.05], 0.19, 0.12, suit);
+    ai_box(out, xf, [0.0, 1.56, -0.12], [0.125, 0.13, 0.15], helmet);
+    ai_box(out, xf, [0.0, 1.55, -0.26], [0.10, 0.045, 0.02], [0.05, 0.06, 0.10]);
+    for s in [-1.0f32, 1.0] {
+        ai_bar(out, xf, [s * 0.21, 1.34, -0.06], [s * 0.30, 1.14, -0.28], 0.055, 0.055, suit);
+        ai_bar(out, xf, [s * 0.30, 1.14, -0.28], [s * 0.36, 1.04, -0.42], 0.05, 0.05, black);
+        ai_bar(out, xf, [s * 0.16, 0.92, 0.34], [s * 0.24, 0.78, -0.08], 0.075, 0.075, black);
+        ai_bar(out, xf, [s * 0.24, 0.78, -0.08], [s * 0.24, 0.40, 0.12], 0.06, 0.06, [0.15, 0.15, 0.18]);
+        ai_box(out, xf, [s * 0.24, 0.33, 0.10], [0.05, 0.04, 0.12], black);
+    }
+}
+
 // ------------------------------------------------------------------
 // Chunk mesh building (pure function of the world; cached by the renderer)
 // ------------------------------------------------------------------
@@ -1736,6 +2101,7 @@ pub struct Game {
     pub rider: [f32; 3],
     spin: f32,
     pub cars: Vec<Car>,
+    pub ai: Option<AiBike>,
     rng: u32,
     pub fox: Option<Fox>,
     fox_timer: f32,
@@ -1768,6 +2134,7 @@ impl Game {
             rider: [0.0; 3],
             spin: 0.0,
             cars,
+            ai: None,
             rng,
             fox: None,
             fox_timer: 8.0,
@@ -1869,10 +2236,12 @@ impl Game {
 
         self.time += dt;
         self.update_cars(dt);
+        self.update_ai(dt);
         self.update_fox(dt);
         self.rail_collision();
         self.tree_collision();
         self.building_collision();
+        self.ai_collision();
         self.rock_collision();
         self.bridge_collision();
         self.bull_collision();
